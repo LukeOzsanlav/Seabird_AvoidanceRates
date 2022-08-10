@@ -8,7 +8,7 @@ Code and data to calculate seabird avoidance rates for collision risk modelling.
 
 ## Suggested Avoidance Rates
 
-![](./Seabird_AvoidanceRates/SuggestedARs/BasicBandAR_table.png)
+![](SuggestedARs/BasicBandAR_table.png)
 
 ## Code description
 
