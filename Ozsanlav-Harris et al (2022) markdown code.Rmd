@@ -1,0 +1,1650 @@
+---
+title: "Calculating avoidance rates for collision risk modelling"
+author: "Luke Ozsanlav-Harris"
+date: "23/02/2022"
+output: html_document
+---
+
+
+```{r eval=FALSE, include=FALSE}
+#Tips for me to make this R markdown
+#This web page has lots of good tips: https://www.earthdatascience.org/courses/earth-analytics/document-your-science/intro-to-the-rmarkdown-format-a#nd-knitr/
+```
+
+
+## Project aim: Calculate avoidance rates for seabirds for use within collison risk modelling
+This is for key species: northern gannet, black-legged kittiwake, lesser black-backed gull, great black-backed gull, herring gull, Sandwich tern, and appropriate species groups such as all terns, small gulls, large gulls and all gulls
+Avoidance rates will be calculated using the basic and extended band models, using the stochastic version of both of these to calculate more robust CIs around estimates
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+### Load the required packages
+
+```{r Load-packages, message=FALSE, warning=FALSE}
+library(lubridate) 
+library(truncnorm) 
+library(foreach) 
+library(doParallel)
+library(ggplot2)
+library(sf)
+library(tidyverse)
+library(ggspatial)
+library(png)
+library(gghalves)
+library(htmltools)
+library(htmlwidgets)
+library(webshot)
+library(sparkline)
+library(formattable)
+library(magrittr)
+library(knitr)
+```
+
+
+## 1. Read in the data sets
+This includes the observed passage and collision data as well as the modeled flight height distributions from Jonstone *et al* (2014)
+At the end it would be good to show the Avoidance rates by species compared to those calculated by Cook (2021)
+
+
+
+```{r Read-in-data, warning=FALSE}
+
+## Set working directory where data & outputs will be stored
+options("scipen"=100, "digits"=8)
+
+
+
+## read in data
+coll.dat = read.table("Data/Ozsanlav-Harris et al (2022) Collision Data.csv", header = T, sep = ",")  ### collated collision & survey data
+flightheight = read.table("Data/Flight Height Data.csv", header = T, sep = ",") ### modeled proportion of birds at collision risk height
+
+BH.boot  = read.table("Data/BH_Boot.csv", header = T, sep = ",") ### Black-headed Gull Flight height bootstraps
+CG.boot  = read.table("Data/CG_Boot.csv", header = T, sep = ",") ### Common Gull Flight height bootstraps
+CT.boot  = read.table("Data/CT_Boot.csv", header = T, sep = ",") ### Common Tern Flight height bootstraps
+GB.boot  = read.table("Data/GB_Boot.csv", header = T, sep = ",") ### Great Black-backed Gull Flight height bootstraps
+HG.boot  = read.table("Data/BH_Boot.csv", header = T, sep = ",") ### Herring Gull Flight height bootstraps
+KI.boot  = read.table("Data/KI_Boot.csv", header = T, sep = ",") ### Kittiwake Flight height bootstraps
+LB.boot  = read.table("Data/LB_Boot.csv", header = T, sep = ",") ### Lesser Black-backed Gull Flight height bootstraps
+NE.boot  = read.table("Data/NE_Boot.csv", header = T, sep = ",") ### Sandwich Tern Flight height bootstraps
+LG.boot  = read.table("Data/LG_Boot.csv", header = T, sep = ",") ### Little Gull Flight height bootstraps
+
+
+```
+
+
+
+------
+
+
+
+## 2. Create the functions used in collsion risk modelling
+The code in the functions will not be given to minimize space but each of the main functions and there use will be given
+
+
+#### Function 1- probability of collisions
+**pcoll()** : Calculate the probability that a bird collides with a rotor if it flies through the rotor sweep zone for the basic band model
+The flux used alongside the collision probability from this function is the percentage of birds passing through the rotor sweep zone derived from the observed percentage 
+of birds at rotor height data and the area of the rotor sweep zone compared to the total area at collision risk height
+
+
+#### Function 2- collision integral
+**coll.int()**: Calculate the average collision integral/probability, this allows the probability of collision to change along the length of a rotor blade
+The flux used alongside the collision probability from this function is just the total flux, but the proportion of flux at rotor height and at each point long the blade
+is calculated using the flight height distributions in Jonstone *et al* (2014)
+
+
+#### Function 3 - daylength calcualtor
+**nhoursday()**: Calculates the length of day and night in hours given a start date, end data and latitude
+
+
+#### Function 4 - standard devation around a ratio
+**std.dev()**: Delta method for estimating SD around a ratio
+
+
+  
+  
+```{r Create-functions-used-in-avoidance-calcualtions, include=FALSE}
+
+
+
+##
+#### 2.1 Function for probability of collision from Basic Band model ####
+##
+
+## use k =1 & 3 blades as default
+## Explaining the variables-
+## Aspect: bird length/wingspan
+## max.chord: width of turbine blade
+## chord:
+## rotor.period: rotor speed in rpm
+## pitch: pitch of the rotor balds
+## prop.flights.upwind:
+## radius:
+## rotor.rad: radius of the rotor
+## prop.flights.upwind:
+
+## This function calculate the probability that a bird collides with a rotor if it flies through the rotor sweep zone for the basic band model
+## This is dependent on the turbines itself and the morphology and flight speed of the bird. 
+pcoll = function(k =1, no.blades = 3, max.chord, pitch, rotor.rad, rotor.period,wingspan, bird.length, aspect, flap.glide, bird.speed,prop.flights.upwind,radius,chord) {
+  
+  ## p(collision) data
+  
+  alpha = bird.speed * rotor.period / (radius * 2 * rotor.rad * pi)
+  
+  alphaLTaspect = which(alpha<aspect)
+  
+  ## upwind p(collision)
+  
+  up_col_length = abs(max.chord * chord * sin(pitch*pi/180) + (alpha * max.chord * chord * cos(pitch*pi/180)))
+  up_col_length2 = (wingspan * alpha) + up_col_length
+  
+  up_col_length2[alphaLTaspect] = bird.length+ up_col_length[alphaLTaspect]
+  
+  up_p_collision = (no.blades/rotor.period)*up_col_length2/bird.speed
+  up_p_collision[up_p_collision > 1] = 1
+  
+  overall_up_p_collision = 2 * (sum(radius[1:19] * up_p_collision[1:19]) + up_p_collision[20]/2) * 0.05
+  
+  
+  ## downwind p(collision)
+  
+  down_col_length = abs(-max.chord * chord * sin(pitch*pi/180) + (alpha * max.chord * chord * cos(pitch*pi/180)))
+  down_col_length2 = (wingspan * alpha) + down_col_length
+  
+  down_col_length2[alphaLTaspect] = bird.length + down_col_length[alphaLTaspect]
+  
+  down_p_collision = (no.blades/rotor.period)*down_col_length2/bird.speed
+  down_p_collision[down_p_collision > 1] = 1
+  
+  overall_down_p_collision = 2 * (sum(radius[1:19] * down_p_collision[1:19]) + down_p_collision[20]/2) * 0.05
+  
+  return(((1-prop.flights.upwind) * overall_down_p_collision) + (prop.flights.upwind * overall_up_p_collision))
+  
+}	
+
+
+
+
+
+
+##                                                                       ##
+#### 2.2 Estimate the number of hours daylight & night during each study ####
+##                                                                       ##
+
+## Assuming it uses trigonometry and latitude to calculate sun angle and the day length
+## There are R package that clauclate this for you
+
+nhoursday = function(start, end, latitude) {
+  day.seq = seq(start, end, by = "day")
+  day.seq = yday(day.seq)
+  
+  DayLength = vector()
+  NightLength = vector()
+  
+  for(zz in 1:length(day.seq)){
+    
+    P = asin(0.39795 * cos (0.2163108 + 2 * atan (0.9671396 * tan(0.0086 * (day.seq[zz] - 186)))))
+    DayLength[zz] = 24 - (24/pi) * acos((sin(0.8333*pi/180) + sin(latitude * pi / 180) * sin (P)) / (cos(latitude *pi /180 ) * cos(P)))
+    NightLength[zz] = 24 - DayLength[zz]
+    
+  }
+  
+  DayLength = sum(DayLength)
+  NightLength = sum(NightLength)
+  
+  return(list(DayLength, NightLength))
+  
+}
+
+
+
+
+
+##
+#### 2.3 Delta method for estimating SD around a ratio ####
+## 
+
+
+std.dev = function(b,c){
+  
+  var.b <- var(b)
+  var.c <- var(c)
+  cov.bc <- cov(b,c)
+  
+  a <- sum(b)/sum(c)
+  
+  pd.a.b <- 1/sum(c)
+  pd.a.c <- -sum(b)/sum(c)^2
+  
+  pd.mat  <- matrix(c(pd.a.b, pd.a.c), nrow=1)
+  vcv.mat <- matrix(c(var.b, cov.bc, cov.bc, var.c), nrow = 2, byrow = TRUE)
+  mat1  <- pd.mat %*% vcv.mat
+  var.a <- mat1   %*% t(pd.mat)
+  
+  return(sqrt(var.a))
+  
+}
+
+
+
+
+
+
+##                                                        ##
+#### 2.4 Functions for extended Band Collision Risk Model ####
+##                                                        ##
+
+## Calculate collision probability at any given point along the rotor blade
+
+pcollex = function (r,phi, updown, Rotor.Diameter, Blade.Width, Rotor.Speed, Pitch, flapglide, wingspan, birdlength, speed, Blades,coverC = coverC) {
+  
+  if(r>1) cell_val =21
+  if(r<=1) which(coverC$rad == abs(round(ceiling(r*100)/5) * 5)/100) -> cell_val
+  
+  upper = coverC[cell_val,1]
+  lower = coverC[cell_val - 1, 1]
+  
+  p = (r - lower) / (upper-lower)
+  c = coverC[cell_val-1, 2] + p * (coverC[cell_val,2] - coverC[cell_val-1,2])
+  
+  
+  radius = Rotor.Diameter/2 * r
+  
+  if(radius ==0) return(1)
+  
+  if(radius !=1) ({
+    
+    chord = Blade.Width * c
+    omega = Rotor.Speed * 2 * pi /60
+    pitch = Pitch * pi /180
+    phi = phi * pi /180
+    
+    if(updown == "up") direction = 1
+    if(updown != "up") direction = -1
+    
+    if(flapglide == "flap")  wingspan-> Wingspan2 
+    if(flapglide != "flap") wingspan * abs(cos(phi))->  Wingspan2
+    
+    multiplier = Blades * omega /(2 * pi * speed)
+    
+    alpha = speed/(radius * omega)
+    
+    CollideLength_1 = abs(direction * chord * sin(pitch) + alpha * chord * cos(pitch))
+    
+    
+    
+    if(birdlength > Wingspan2 * alpha) birdlength -> CollideLength2
+    if(birdlength <= Wingspan2 * alpha) Wingspan2 * alpha -> CollideLength2
+    
+    return(multiplier * (CollideLength_1 + CollideLength2))
+    
+  })
+  
+}
+
+
+
+
+## calculate collision integral to account for risk and birds both varying with height
+      
+
+
+## Function 1 that feeds into collision integral 
+
+pcollxy = function(x,y,updown, Rotor.Diameter, Blade.Width, Rotor.Speed, Pitch, flapglide, wingspan, birdlength, speed, Blades,coverC = coverC) {
+  
+  r = (x * x + y * y) ^ 0.5
+  
+  if( y == 0 & x >= 0) pi /2 -> phi
+  if( y == 0 & x < 0) -pi/2 -> phi
+  if(y != 0)	atan (x/y) -> phi
+  if( y <0) (phi + pi)*180/pi -> phi2
+  if(y >= 0) phi*180/pi -> phi2
+  
+  pcollex(r,phi2,updown, Rotor.Diameter=Rotor.Diameter, Blade.Width=Blade.Width, Rotor.Speed=Rotor.Speed, Pitch = Pitch, flapglide = flapglide, wingspan=wingspan, birdlength=birdlength, speed=speed, Blades=Blades,coverC = coverC)
+  
+  
+}
+
+
+
+## Function 2 that feeds into collision integral 
+
+xrisksum2 = function (y, xinc,updown, Rotor.Diameter, Blade.Width, Rotor.Speed, Pitch, flapglide, wingspan, birdlength, speed, Blades,coverC = coverC) {
+  
+  xmax = (1- y * y) ^ 0.5
+  imax = as.integer (xmax/xinc)
+  
+  risk = (pcollxy (imax * xinc, y, updown, Rotor.Diameter=Rotor.Diameter, Blade.Width=Blade.Width, Rotor.Speed=Rotor.Speed, Pitch = Pitch, flapglide = flapglide, wingspan=wingspan, birdlength=birdlength, speed=speed, Blades=Blades,coverC = coverC) / 2 + pcollxy(xmax, y, updown, Rotor.Diameter=Rotor.Diameter, Blade.Width=Blade.Width, Rotor.Speed=Rotor.Speed, Pitch = Pitch, flapglide = flapglide, wingspan=wingspan, birdlength=birdlength, speed=speed, Blades=Blades,coverC = coverC)/2) * (xmax - imax * xinc)
+  
+  if(imax<=0) return(2*risk)		
+  
+  if(imax>0)({
+    
+    risk2 = risk + (pcollxy(0,y,updown, Rotor.Diameter=Rotor.Diameter, Blade.Width=Blade.Width, Rotor.Speed=Rotor.Speed, Pitch = Pitch, flapglide = flapglide, wingspan=wingspan, birdlength=birdlength, speed=speed, Blades=Blades,coverC = coverC) / 2 + pcollxy(imax * xinc, y, updown, Rotor.Diameter=Rotor.Diameter, Blade.Width=Blade.Width, Rotor.Speed=Rotor.Speed, Pitch = Pitch, flapglide = flapglide, wingspan=wingspan, birdlength=birdlength, speed=speed, Blades=Blades,coverC = coverC)/2) * xinc
+    
+    for (i in 1: (imax - 1)) {
+      
+      risk2 = risk2 + pcollxy(i * xinc, y, updown, Rotor.Diameter=Rotor.Diameter, Blade.Width=Blade.Width, Rotor.Speed=Rotor.Speed, Pitch = Pitch, flapglide = flapglide, wingspan=wingspan, birdlength=birdlength, speed=speed, Blades=Blades,coverC = coverC) * xinc
+      
+    }
+    
+    return(2*risk2)
+    
+  })
+  
+}
+
+                                                                                
+## collison integral function
+coll.int = function(HD.y,HD.d.y, FluxInt, Blades, HubHeight, Rotor.Diameter, Blade.Width, Rotor.Speed,Pitch,speed,flapglide,birdlength,wingspan, FH.dat, Prop_Upwind,coverC = coverC){
+  
+  CollMinUP = HD.d.y[1] * xrisksum2(HD.y[1], 0.05, "up", Rotor.Diameter=Rotor.Diameter, Blade.Width=Blade.Width, Rotor.Speed=Rotor.Speed, Pitch = Pitch, flapglide = flapglide, wingspan=wingspan, birdlength=birdlength, speed=speed, Blades=Blades,coverC = coverC) / 2 ### risk at lowest point on rotor blade
+  CollIntUP = CollMinUP + HD.d.y[41] * xrisksum2(HD.y[41], 0.05, "up", Rotor.Diameter=Rotor.Diameter, Blade.Width=Blade.Width, Rotor.Speed=Rotor.Speed, Pitch = Pitch, flapglide = flapglide, wingspan=wingspan, birdlength=birdlength, speed=speed, Blades=Blades,coverC = coverC) / 2 ### risk at highest point on rotor blade
+  
+  for (i in 2:40) {CollIntUP = CollIntUP + HD.d.y[i] * xrisksum2(HD.y[i], 0.05, "up", Rotor.Diameter=Rotor.Diameter, Blade.Width=Blade.Width, Rotor.Speed=Rotor.Speed, Pitch = Pitch, flapglide = flapglide, wingspan=wingspan, birdlength=birdlength, speed=speed, Blades=Blades,coverC = coverC) } #### Fill in intermediate heights
+  
+  CollIntUP = CollIntUP * 0.05 * (2/pi)
+  
+  ## Down wind
+  
+  CollMinDown = HD.d.y[1] * xrisksum2(HD.y[1], 0.05, "down", Rotor.Diameter=Rotor.Diameter, Blade.Width=Blade.Width, Rotor.Speed=Rotor.Speed, Pitch = Pitch, flapglide = flapglide, wingspan=wingspan, birdlength=birdlength, speed=speed, Blades=Blades,coverC = coverC) / 2 ### risk at lowest point on rotor blade
+  CollIntDown = CollMinDown + HD.d.y[41] * xrisksum2(HD.y[41], 0.05, "down", Rotor.Diameter=Rotor.Diameter, Blade.Width=Blade.Width, Rotor.Speed=Rotor.Speed, Pitch = Pitch, flapglide = flapglide, wingspan=wingspan, birdlength=birdlength, speed=speed, Blades=Blades,coverC = coverC) / 2 ### risk at highest point on rotor blade
+  
+  for (i in 2:40) { CollIntDown = CollIntDown + HD.d.y[i] * xrisksum2(HD.y[i], 0.05, "down", Rotor.Diameter=Rotor.Diameter, Blade.Width=Blade.Width, Rotor.Speed=Rotor.Speed, Pitch = Pitch, flapglide = flapglide, wingspan=wingspan, birdlength=birdlength, speed=speed, Blades=Blades,coverC = coverC) } #### Fill in intermediate heights
+  
+  
+  CollIntDown = CollIntDown * 0.05 * (2/pi)
+  
+  ## Average Collision Integral
+  
+  CollInt = (Prop_Upwind * CollIntUP) + ((1-Prop_Upwind) * CollIntDown)
+  
+  return(CollInt)
+  
+}
+
+
+
+
+
+
+
+##                                                                 ##
+#### 2.5 Functions for Christie & Urquhart extension to Band model ####
+##                                                                 ##
+
+#### Step 1
+
+PrC = function(Radius, Blades, pitch, chord.width, angvel, length, wingspan, delta, BF10G11, WGamma, WBSpeed, RelRad, RelChord, theta, c, s, Tarc, RotorV) {
+  
+  ## vector velocity of bird
+  
+  vbx = -WBSpeed * sin(delta)
+  vby = 0
+  vbz = WBSpeed * cos(delta)
+  
+  ## vector of chord at theta = 0
+  
+  cx0 = RelChord[1] * chord.width * cos(pitch)
+  cy0 = 0
+  cz0 = RelChord[1] * chord.width * sin(pitch)
+  
+  ## vector length of bird
+  
+  blx = -length * sin (WGamma)
+  bly = 0 
+  blz = length * cos(WGamma)
+  
+  ## vector wingspan of gliding bird
+  
+  bwgx = wingspan * cos(WGamma)
+  bwgy = 0
+  bwgz = wingspan * sin (WGamma)
+  
+  ## vector velocity of rotor		
+  
+  vrx = RotorV[1] * c
+  vry = -RotorV[1] * s
+  vrz = 0
+  
+  ## vector velocity of bird relative to blade
+  
+  u = vbx-vrx
+  v = vby-vry
+  w= vbz - vrz
+  
+  if (w ==0 | is.na(w)) w = 0.000000001  ## so we don't divide by 0
+  
+  ## vector of chord rotated through theta	
+  
+  cx = cx0 * c
+  cy = -s * cx0
+  cz = cz0
+  
+  
+  l = cx+blx
+  m = cy + bly
+  n = cz + blz
+  
+  L1 = abs(((w*l-u*n)*c+(v*n-w*m)*s)/w)
+  
+  
+  l2 = cx-blx
+  m2= cy-bly
+  n2 = cz-blz
+  
+  L2 = abs(((w*l2-u*n2)*c+(v*n2-w*m2)*s)/w)
+  
+  
+  l3 = cx + bwgx
+  m3 = cy+bwgy
+  n3 = cz + bwgz
+  
+  L3 = abs(((w*l3-u*n3)*c+(v*n3-w*m3)*s)/w)
+  
+  l4 = cx-bwgx
+  m4 = cy-bwgy
+  n4 = cz-bwgz
+  
+  L4 = abs(((w*l4-u*n4)*c+(v*n4-w*m4)*s)/w)
+  
+  ## wingspan of a flapping bird rotated
+  
+  p = c* cos(WGamma)
+  q = -s * cos(WGamma)
+  r = c*sin(WGamma)
+  
+  k = wingspan/(p^2+q^2+r^2)^0.5
+  bwfx = k*p
+  bwfy = k*q
+  bwfz = k*r
+  
+  l5 = cx+bwfx
+  m5 = cy+bwfy
+  n5 = cz+bwfz
+  
+  L5 = abs(((w*l5-u*n5)*c+(v*n5-w*m5)*s)/w)
+  
+  l6 = cx-bwfx
+  m6 = cy-bwfy
+  n6 = cz-bwfz
+  
+  L6 = abs(((w*l6-u*n6)*c+(v*n6-w*m6)*s)/w)
+  
+  ## is bird flapping or gliding?
+  # 0 = flapping
+  # 1 = gliding
+  
+  if(BF10G11 == 0) ColLength = pmax(L1, L2, L3, L4, L5, L6)
+  if(BF10G11 == 1) ColLength = pmax(L1, L2, L3, L4)
+  
+  
+  Ptot = min(ColLength[1]/Tarc[1], 1) + (2*min(ColLength[2]/Tarc[1], 1)) + (2*min(ColLength[3]/Tarc[1], 1)) + (2*min(ColLength[4]/Tarc[1], 1)) + (2*min(ColLength[5]/Tarc[1], 1)) + (2*min(ColLength[6]/Tarc[1], 1)) + (min(ColLength[7]/Tarc[1], 1))
+  
+  PrC = Ptot/12
+  return(PrC)
+} 
+
+################ Step 2
+
+mean.coll.risk = function(RelRad, RelChord, simpsons.weight, theta, c,s,Radius, Blades, pitch, chord.width, period, length, wingspan, speed, BF10G11, min.angle, max.angle, wind.speed){
+  
+  angle.head = seq(min.angle,max.angle,5)
+  cor.pcoll = vector()
+  
+  for(abc in 1:length(angle.head)) {
+    
+    ## transform parameters for model
+    
+    delta = angle.head[abc]*pi/180
+    WGamma = delta - asin(wind.speed/speed*sin(delta))
+    WBSpeed = (wind.speed^2 + speed^2 - 2*wind.speed * speed *cos(WGamma))^0.5
+    angvel = 2*pi/period
+    Tarc = 2* pi * RelRad * Radius/Blades
+    RotorV = RelRad * Radius * angvel
+    
+    col.vec = vector()
+    
+    for(i in 1:20){ col.vec[i] = 2 * 0.05 *RelRad[i] *PrC(Radius, Blades, pitch, chord.width,angvel, length, wingspan,delta,BF10G11, WGamma, WBSpeed, RelRad[i],RelChord[i],theta,c, s, Tarc[i], RotorV[i])}
+    
+    ######## average collision risk along blade, weighted by Simpson's Rule to better approximate ara under the curve
+    
+    col.entry = sum(simpsons.weight*col.vec)/3
+    
+    ######## Correct to reflect that area visible to bird as it approaches 
+    ######## is smaller than area visible to bird approaching perpendicularly
+    
+    ## calculate frontal area
+    
+    AFront = pi * Radius^2
+    
+    ## calculate area covered by side of the turbine
+    
+    ASide = (mean(RelChord) * chord.width * sin(pitch) + wingspan) * 2 * Radius
+    
+    ## Calculate the area visible
+    
+    AVis = AFront * abs(cos(delta)) + ASide * abs(sin(delta))
+    
+    ## now correct probability of collision
+    
+    cor.pcoll[abc] = col.entry * AVis/AFront
+    
+  }
+  
+  return(cor.pcoll)
+  
+}
+
+
+
+
+#### End of functions ####
+
+
+
+```
+
+
+------
+
+
+## 3. Calcualte length of day and night for all wind farms during the study period
+This allows the total flux through the windfarm to be calculated during the study period based off of the hourly passage rate
+
+```{r Lenghth-of-day-and-night}
+
+## format start date and end date into dates
+
+coll.dat$start.date = as.Date(coll.dat$start.date, format = "%d/%m/%Y")
+coll.dat$end.date = as.Date(coll.dat$end.date, format = "%d/%m/%Y")
+
+##### create columns for number of ours daylight & night in each survey			
+
+coll.dat$HoursDay = 0
+coll.dat$HoursNight = 0
+
+### now use this to estimate n hours daylight & night
+for(i in 1:nrow(coll.dat)) { 
+  
+  if(!is.na(coll.dat$end.date[i]) )({ 
+    hours = nhoursday(coll.dat$start.date[i], coll.dat$end.date[i],coll.dat$Latitude[i])
+    coll.dat$HoursDay[i] = hours[1]
+    coll.dat$HoursNight[i] = hours[2]
+  })
+}
+
+
+
+```
+
+
+------
+
+
+
+## 4. Calculate predicted number of collsions for Basic Band model (2012)
+This section of code calculates the number of collisions in the absence of avoidance for the basic band model
+
+
+```{r Basic-band-predicted-collions}
+
+## need to get area of survey window at collision risk height
+## calculate area of survey window that is at CRH
+coll.dat$area.survey.window = coll.dat$width.of.survey.area * coll.dat$rotor.diameter
+## calculate the total rotor sweep zone for all turbines in the study
+coll.dat$total.rotor.frontal.area = coll.dat$number.of.turbines * pi * (coll.dat$rotor.diameter/2)^2
+
+
+
+## For sites where we do not have a proportion of birds at risk height from site-specific survey data, we need to estimate this from the 
+## Johnston et al. modeled distributions
+
+## initiate column
+coll.dat$FH.modelled = 0
+
+## loop through each row in the main data set with passage & collions data
+for(i in 1:nrow( coll.dat)) {
+  
+  ## extract the modeled flight height data for the appropriate species
+  ## This data set is in 1 meter increments, therefore the row number just correspond to a number of meters
+  sp.fh.dat = flightheight[ , grepl( paste(coll.dat$Species.for.Flight.Height.Distribution[i], ".est", sep = ""), names( flightheight ) ) ]
+  min.rotor.height = coll.dat$hub.height[i] - (0.5 * coll.dat$rotor.diameter[i])
+  max.rotor.height = coll.dat$hub.height[i] + (0.5 * coll.dat$rotor.diameter[i])
+  ## calculate the proportion of birds within the rotor sweep zone based off of the modeled flight height values
+  coll.dat$FH.modelled[i] = sum(sp.fh.dat[min.rotor.height:max.rotor.height])
+  
+}
+
+#### get proportion of birds at risk height for sites with no site-specific data
+coll.dat$X..flights.at.rotor.height[is.na(coll.dat$X..flights.at.rotor.height)] = coll.dat$FH.modelled[is.na(coll.dat$X..flights.at.rotor.height)]
+
+
+
+#### Now work out the probability of collision at each site
+## vectors needed for the Band model
+
+radius = seq(0.05, 1, 0.05)
+chord = c(0.73, 0.79, 0.88, 0.96, 1, 0.98, 0.92, 0.85, 0.80, 0.75,0.7, 0.64,0.58,0.52,0.47,0.41,0.37,0.30,0.24, 0)
+
+## this applies function 2.1 to each row in coll.dat
+## calculate the probability that a bird collides with a rotor if it flies through the rotor sweep zone
+for(i in 1:nrow(coll.dat)){
+  
+  coll.dat$Pcoll[i] = pcoll(k =1, no.blades = 3, max.chord = coll.dat$blade.width[i], pitch = coll.dat$rotor.pitch[i], rotor.rad = coll.dat$rotor.diameter[i]/2, rotor.period = 60/coll.dat$rotor.speed[i],wingspan = coll.dat$wingspan[i], bird.length = coll.dat$BirdLength[i], aspect = coll.dat$BirdLength[i]/coll.dat$wingspan[i], flap.glide = 0, bird.speed = coll.dat$flight.speed[i],prop.flights.upwind = 0.5,radius,chord)
+  
+}
+
+
+########## Now need to add column to main data set shown total number of birds passing at collision risk height
+coll.dat$HoursDay = as.numeric(coll.dat$HoursDay)
+coll.dat$HoursNight = as.numeric(coll.dat$HoursNight)
+
+## re-calculate passage rate for the rows that already had a passage rate entered in excel
+coll.dat$passage.rate[!is.na(coll.dat$Number.of.birds.recorded)] = coll.dat$Number.of.birds.recorded[!is.na(coll.dat$Number.of.birds.recorded)]/coll.dat$N.Hours.monitoring[!is.na(coll.dat$Number.of.birds.recorded)]
+
+### re-calculate calculate total flux by adding passage rates*number of hours during the day and night (had a correction of 0.25 or 0 depending on species)
+coll.dat$total.flux[!is.na(coll.dat$passage.rate)]  = (coll.dat$passage.rate[!is.na(coll.dat$passage.rate)]  * coll.dat$HoursNight[!is.na(coll.dat$passage.rate)]  * coll.dat$Nocturnal.Correction[!is.na(coll.dat$passage.rate)]) + 
+  (coll.dat$passage.rate[!is.na(coll.dat$passage.rate)] * coll.dat$HoursDay[!is.na(coll.dat$passage.rate)] ) 
+
+## for rows with density estimates calculate total flux with survey area/density/flight speed/Number of hours daylight
+coll.dat$total.flux[!is.na(coll.dat$density)] = (3600/(coll.dat$width.of.survey.area[!is.na(coll.dat$density)]/coll.dat$flight.speed[!is.na(coll.dat$density)])) * coll.dat$HoursDay[!is.na(coll.dat$density)] * (coll.dat$density[!is.na(coll.dat$density)] * coll.dat$Survey.area[!is.na(coll.dat$density)])
+
+
+## NOTE: i think this is wrong to multiply by * (coll.dat$total.rotor.frontal.area/coll.dat$area.survey.window)
+## this is a ratio between the width of the survey window and the toal frontal area of the rotor sweep zones
+## In a turbines array the width of the survey area may only accommodate a portion of the turbines as they are in rows
+## But to calcualte total rotor frontal area all the turbines in the array are used
+## I think this then makes the ratio calculate too large, i.e. the proportion of the survey width that is in the sweep zone is too high
+
+## Calculate total flux within the rotor sweep zone
+coll.dat$flux.CRH = coll.dat$total.flux * coll.dat$X..flights.at.rotor.height * (coll.dat$total.rotor.frontal.area/coll.dat$area.survey.window)
+
+## calculte the number of collsions in the absence of avoidance by multiplying the total flux through the rotor sweep zone by the probability of colising with the rotor
+coll.dat$PredColl.NoAvoid.Opt1 = coll.dat$Pcoll *  coll.dat$flux.CRH
+
+```
+
+
+
+
+
+
+
+## 5. Summarise basic band model avoidance rates for species and species groups
+
+These plots show the avoidance rates at the species level and some key groupings for the basic band model
+The confidence intervals here just represent the variation between data set rows in avoidance rates
+(a row can be one wind farm over multiple years, one wind farm over one season or 1 turbine within a wind farm)
+
+
+```{r Species-level-avoidance-basic-band, echo=FALSE, message=FALSE, warning=FALSE}
+
+### get avoidance rates summarized by species & group
+spp = unique(coll.dat$Species)
+Basic.Band.Spp.Avoid = vector()
+Basic.Band.Spp.AvoidSD = vector()
+Basic.Band.Spp.AvoidUpCI = vector()
+Basic.Band.Spp.AvoidLowCI = vector()
+
+## now for each unique value in the species column calculate ratio of estimated collision to predicted collisions (calculated above)
+for(i in 1:length(spp)) {
+  
+  Basic.Band.Spp.Avoid[i] = 1-(sum(coll.dat$Estimated.Collisions[coll.dat$Species == spp[i]])/sum(coll.dat$PredColl.NoAvoid.Opt1[coll.dat$Species == spp[i]]))
+  Basic.Band.Spp.AvoidSD[i] = std.dev(coll.dat$Estimated.Collisions[coll.dat$Species == spp[i]], coll.dat$PredColl.NoAvoid.Opt1[coll.dat$Species == spp[i]])
+  Basic.Band.Spp.AvoidUpCI[i] = Basic.Band.Spp.Avoid[i] + (1.96 * Basic.Band.Spp.AvoidSD[i])
+  Basic.Band.Spp.AvoidLowCI[i] = Basic.Band.Spp.Avoid[i] - (1.96 * Basic.Band.Spp.AvoidSD[i])
+  
+}
+## create a table of the output
+Basic.Band.Avoid.Spp.Table = data.frame(Species = spp, Avoidance = Basic.Band.Spp.Avoid, AvoidanceSD = Basic.Band.Spp.AvoidSD, 
+                                        AvoidanceLCL = Basic.Band.Spp.AvoidLowCI, AvoidanceUCL = Basic.Band.Spp.AvoidUpCI)
+
+
+```
+
+```{r Group-level-avoidance-basic-band, echo=FALSE, message=FALSE, warning=FALSE}
+
+
+## now do the same as above but for species groups
+group = unique(coll.dat$group)
+Basic.Band.Group.Avoid = vector()
+Basic.Band.Group.AvoidSD = vector()
+Basic.Band.Group.AvoidUpCI = vector()
+Basic.Band.Group.AvoidLowCI = vector()
+
+for(i in 1:length(group)) {
+  
+  Basic.Band.Group.Avoid[i] = 1-(sum(coll.dat$Estimated.Collisions[coll.dat$group == group[i]])/sum(coll.dat$PredColl.NoAvoid.Opt1[coll.dat$group == group[i]]))
+  Basic.Band.Group.AvoidSD[i] = std.dev(coll.dat$Estimated.Collisions[coll.dat$group == group[i]], coll.dat$PredColl.NoAvoid.Opt1[coll.dat$group == group[i]])
+  Basic.Band.Group.AvoidUpCI[i] = Basic.Band.Group.Avoid[i] + (1.96 * Basic.Band.Group.AvoidSD[i])
+  Basic.Band.Group.AvoidLowCI[i] = Basic.Band.Group.Avoid[i] - (1.96 * Basic.Band.Group.AvoidSD[i])
+  
+}
+## think this might be fixing some kind of error
+Basic.Band.Group.Avoid[4] = 1-(sum(coll.dat$Estimated.Collisions[coll.dat$group %in% c("small gull", "large gull", "gull")])/sum(coll.dat$PredColl.NoAvoid.Opt1[coll.dat$group %in% c("small gull", "large gull", "gull")]))
+Basic.Band.Group.AvoidSD[4] = std.dev(coll.dat$Estimated.Collisions[coll.dat$group %in% c("small gull", "large gull", "gull")], coll.dat$PredColl.NoAvoid.Opt1[coll.dat$group  %in% c("small gull", "large gull", "gull")])
+Basic.Band.Group.AvoidUpCI[4] = Basic.Band.Group.Avoid[4] + (1.96 * Basic.Band.Group.AvoidSD[4])
+Basic.Band.Group.AvoidLowCI[4] = Basic.Band.Group.Avoid[4] - (1.96 * Basic.Band.Group.AvoidSD[4])
+
+
+## create a table of results for species groups
+Basic.Band.Avoid.Group.Table = data.frame(Species = group, Avoidance = Basic.Band.Group.Avoid, AvoidanceSD = Basic.Band.Group.AvoidSD, AvoidanceLCL = Basic.Band.Group.AvoidLowCI, AvoidanceUCL = Basic.Band.Group.AvoidUpCI)
+
+## Add data for all gulls and terns
+BBAvoid <- 1-(sum(coll.dat$Estimated.Collisions)/sum(coll.dat$PredColl.NoAvoid.Opt1))
+BBAvoidSD <- std.dev(coll.dat$Estimated.Collisions, coll.dat$PredColl.NoAvoid.Opt1)
+BBAvoidUpCI <- BBAvoid + (1.96 *BBAvoidSD)
+BBAvoidLowCI <- BBAvoid - (1.96 * BBAvoidSD)
+Basic.Band.Avoid.Group.Table$Species <- as.character(Basic.Band.Avoid.Group.Table$Species)
+Basic.Band.Avoid.Group.Table <- rbind(Basic.Band.Avoid.Group.Table, c("Gulls & terns", BBAvoid, BBAvoidSD, BBAvoidUpCI, BBAvoidLowCI))
+
+
+
+Basic.Band.Avoid.Group.Table = rbind(Basic.Band.Avoid.Spp.Table,Basic.Band.Avoid.Group.Table)
+
+Basic.Band.Avoid.Group.Table$Avoidance <- as.numeric(Basic.Band.Avoid.Group.Table$Avoidance)
+Basic.Band.Avoid.Group.Table$AvoidanceSD <- as.numeric(Basic.Band.Avoid.Group.Table$AvoidanceSD)
+Basic.Band.Avoid.Group.Table$AvoidanceLCL <- as.numeric(Basic.Band.Avoid.Group.Table$AvoidanceLCL)
+Basic.Band.Avoid.Group.Table$AvoidanceUCL <- as.numeric(Basic.Band.Avoid.Group.Table$AvoidanceUCL)
+Basic.Band.Avoid.Group.Table$ARs = paste(round(Basic.Band.Avoid.Group.Table[,2],4), " (",round(Basic.Band.Avoid.Group.Table[,3],4), "; ", round(Basic.Band.Avoid.Group.Table[,4],4), " - ", round(Basic.Band.Avoid.Group.Table[,5],4),")", sep = "") 
+
+## sometimes keep NAs in so going to remove thee row is species is NA
+Basic.Band.Avoid.Group.Table <- filter(Basic.Band.Avoid.Group.Table, Species %in% c("Gulls & terns", "tern", "little tern", "common tern", "sandwich tern", "small gull", "large gull", "gull", "great black-backed gull", "lesser black-backed gull", "herring gull", "black-headed gull", "common gull" ,"kittiwake"))
+
+
+
+#### Now plot the avoidance rates and their CIs
+## filter out the species I want for this report
+BasicBand_group_avoidance <- Basic.Band.Avoid.Group.Table
+BasicBand_group_avoidance$Species <- as.character(BasicBand_group_avoidance$Species)
+BasicBand_group_avoidance$Species <- as.factor(BasicBand_group_avoidance$Species)
+
+## order the factor so the group plot in the order I want
+BasicBand_group_avoidance$Species <- factor(BasicBand_group_avoidance$Species, levels = c("Gulls & terns", "tern", "little tern", "common tern", "sandwich tern", "small gull", "large gull", "gull", "great black-backed gull", "lesser black-backed gull", "herring gull", "black-headed gull", "common gull" ,"kittiwake"))
+
+
+## This bit of code was to save the outputs for the Cook (2021) data sets
+#BasicBand_group_avoidance$Source <- "Cook (2021)"
+#write_csv(BasicBand_group_avoidance, file = "~/Turbine CRM analysis/Cook (2021) outputs/BasicBand_ARs_Cook.csv")
+
+```
+
+
+```{r Group-level-avoidance-basic-band-plotting, echo=FALSE, message=FALSE, warning=FALSE}
+## Now read in the Cook 2021 data
+Cook_BasicBandAR <- read_csv("~/Turbine CRM analysis/Cook (2021) outputs/BasicBand_ARs_Cook.csv")
+
+
+## Bind together my data set and the cook data set
+BasicBand_group_avoidance$Source <- "Ozsanlav-Harris et al (2022)"
+AllBasicBand_ARs <- rbind(BasicBand_group_avoidance, Cook_BasicBandAR)
+
+## Filter out the species I want and then alter the species names
+AllBasicBand_ARs <- filter(AllBasicBand_ARs, Species %in% c("Gulls & terns", "tern", "sandwich tern", "small gull", "large gull", "gull", 
+                                                            "great black-backed gull", "lesser black-backed gull", "herring gull", "black-headed gull" ,"kittiwake"))
+AllBasicBand_ARs$Species <- as.character(AllBasicBand_ARs$Species)
+AllBasicBand_ARs$Species <- paste(toupper(substr(AllBasicBand_ARs$Species, 1, 1)), substr(AllBasicBand_ARs$Species, 2, nchar(AllBasicBand_ARs$Species)), sep="")
+
+AllBasicBand_ARs$Species <- factor(AllBasicBand_ARs$Species, levels = c("Gulls & terns", "Tern", "Sandwich tern", "Small gull", "Large gull", "Gull", 
+                                                                                          "Great black-backed gull", "Lesser black-backed gull", "Herring gull", "Black-headed gull" ,"Kittiwake"))
+
+
+
+pd<- position_dodge(0.7)
+ggplot(AllBasicBand_ARs, aes(x= Species, y = Avoidance, colour = Source))+
+  geom_point(aes(color = Source), position = pd)+
+  geom_errorbar(aes(ymin=AvoidanceLCL, ymax=AvoidanceUCL, colour= Source), position=pd, width=0.5) +
+  coord_flip() +
+  theme_bw() +
+  scale_colour_manual(values=c("#0072B2", "#D55E00")) +
+  ylab("Basic Band avoidance rate") + xlab("Species/Species group") +
+  theme(panel.grid.major.y = element_blank(), panel.grid.minor.y = element_blank(), 
+        axis.text=element_text(size=10), axis.title=element_text(size=14, face = "bold"), 
+        plot.title = element_text(size=12, face="bold"), panel.grid.minor.x = element_blank())
+
+
+
+## Read in or save the plots from Cook 2021
+setwd("~/Turbine CRM analysis/OH et al (2022) plots")
+## Save a plot
+#ggsave("BasicBand_SpeciesGroup.png", 
+#       width = 28, height = 15, units = "cm")
+
+
+
+
+
+## Now read in the Cook 2021 data
+Cook_BasicBandAR <- read_csv("~/Turbine CRM analysis/Cook (2021) outputs/BasicBand_ARs_Cook.csv")
+Cook_BasicBandAR$ARs = paste(round(Cook_BasicBandAR$Avoidance,4), " (",round(Cook_BasicBandAR$AvoidanceSD,4), "; ", round(Cook_BasicBandAR$AvoidanceLCL,4), " - ", round(Cook_BasicBandAR$AvoidanceUCL,4),")", sep = "") 
+
+
+
+## Create a table for the ARs
+Cook_BasicBandAR$AR_2020 <- BasicBand_group_avoidance$ARs
+Cook_BasicBandAR$dif <- ((BasicBand_group_avoidance$Avoidance-Cook_BasicBandAR$Avoidance)/Cook_BasicBandAR$Avoidance)*100
+colnames(Cook_BasicBandAR)
+TableBasicARs <- subset(Cook_BasicBandAR, select = c("Species", "ARs", "AR_2020", "dif"))
+TableBasicARs <- filter(TableBasicARs, Species %in% c("Gulls & terns", "tern", "sandwich tern", "small gull", "large gull", "gull", 
+                                                            "great black-backed gull", "lesser black-backed gull", "herring gull", "black-headed gull" ,"kittiwake"))
+data.table::setnames(TableBasicARs, old = c("Species", "ARs", "AR_2020", "dif"), 
+                        new = c("Species/Species group", "Cook (2021)", "Ozsanlav-Harris et al (2022)", "% change in rate"))
+
+TableBasicARs$`Species/Species group` <- as.character(TableBasicARs$`Species/Species group`)
+TableBasicARs$`Species/Species group` <- paste(toupper(substr(TableBasicARs$`Species/Species group`, 1, 1)), substr(TableBasicARs$`Species/Species group`, 2, nchar(TableBasicARs$`Species/Species group`)), sep="")
+
+TableBasicARs$`Species/Species group` <- factor(TableBasicARs$`Species/Species group`, levels = c("Gulls & terns", "Tern", "Sandwich tern", "Small gull", "Large gull", "Gull", 
+                                                                                          "Great black-backed gull", "Lesser black-backed gull", "Herring gull", "Black-headed gull" ,"Kittiwake"))
+
+
+
+## Create the table suing Formattable
+TableBasicARs <- TableBasicARs[c(5,1,3,2,4,10,8,7,6,9,11),]
+TableBasicARs$`% change in rate` <- round(TableBasicARs$`% change in rate`, digits = 3)
+customGreen = "#71CA97"
+customRed = "#ff7f7f"
+improvement_formatter <- formatter("span", 
+                                   style = x ~ style(font.weight = "bold", 
+                                                     color = ifelse(x > 0, customGreen, ifelse(x < 0, customRed, "black"))), 
+                                   x ~ icontext(ifelse(x>0, "arrow-up", ifelse(x < 0, "arrow-down", "equal")), x)
+                                   )
+
+BasicTable <- formattable(TableBasicARs, align =c("l","c","c", "c"), list(
+  `Species/Species group` = formatter("span", style = ~ style(color = "grey", font.weight = "bold")), 
+  `% change in rate`= improvement_formatter
+))
+
+
+
+w <- as.htmlwidget(BasicTable, width = 1250, height = 500)
+path <- html_print(w, background = "white", viewer = NULL)
+url <- paste0("file:///", gsub("\\\\", "/", normalizePath(path)))
+
+setwd("~/Turbine CRM analysis/OH et al (2022) plots")
+outputpath <- paste0("BasicBandAR_", " table", ".png")
+
+#webshot::webshot(url = url, file = outputpath, 
+#                vwidth = 1250, vheight = 500)
+
+
+
+
+```
+
+
+
+------
+
+
+
+## 6. Calculate predicted number of collsions for the Extended Band model
+This section of code calculates the number of collisions in the absence of avoidance for the extended band model
+It calculates the proportion of the total flux at each point along the rotor diameter using the flight height distributions in Jonstone *et al* (2014)
+
+
+```{r Extended-band-predicted-collions}
+
+## I think that this approach only used modeled flight height data in Johnston et al 2014
+## try paralleling to improve speed
+
+comb <- function(...) {
+  mapply('cbind', ..., SIMPLIFY=FALSE)
+}
+
+
+if(nrow(coll.dat) >= detectCores()) cl <- makeCluster(detectCores())
+if(nrow(coll.dat) < detectCores()) cl = makeCluster(niter)
+
+registerDoParallel(cl)
+
+
+##
+
+
+HD.y = round(seq(-1,1,0.05),2)
+rad = round(seq(0,1,0.05),2) ###### very convoluted, but necessary due to the way R treats seq...
+c = c(0.69,0.73,0.79,0.88,0.96,1,0.98,0.92,0.85,0.8,0.75,0.7,0.64,0.58,0.52,0.47,0.41,0.37,0.3,0.24,0)
+coverC = data.frame(cbind(rad,c))
+
+coll.int.out = foreach(i = 1:nrow(coll.dat), .combine = "comb") %dopar% {
+  
+  ## get modelled flight height distributions for each species
+  FH.dat = flightheight[ , grepl( paste(coll.dat$Species.for.Flight.Height.Distribution[i], ".est", sep = ""), names( flightheight ) ) ]
+  
+  ## Calcualte probabiltiy of collsion at 41 points along the rotor blade, number of points determined by values in HD.y
+  height = coll.dat$hub.height[i] + (HD.y * (coll.dat$rotor.diameter[i]/2))
+  HD.d.y = (((height-floor(height)) * (FH.dat[ceiling(height)+1] - FH.dat[floor(height)+1])) + FH.dat[floor(height)+1]) * coll.dat$rotor.diameter[i]/2
+  FluxMin = HD.d.y[1] * (2 * ((1 - HD.y[1] * HD.y[1])^0.5)) / 2 ### risk at lowest point on rotor blade
+  FluxInt = FluxMin + HD.d.y[41] * (2 * ((1 - HD.y[41] * HD.y[41])^0.5)) / 2 ### risk at highest point on rotor blade
+  for (zz in 2:40) { FluxInt = FluxInt + HD.d.y[zz] * (2 * ((1 - HD.y[zz] * HD.y[zz])^0.5)) } #### Fill in intermediate heights
+  FluxInt = FluxInt * 0.05 * (2/pi)
+  
+  ## now calculate the probability of collision if a bird passes through the rotor sweep zone using the collision integral
+  out =coll.int(	HD.y = HD.y, HD.d.y = HD.d.y, FluxInt = FluxInt,
+                 Blades = 3, 
+                 HubHeight =  coll.dat$hub.height[i], 
+                 Rotor.Diameter = coll.dat$rotor.diameter[i], 
+                 Blade.Width = coll.dat$blade.width[i], 
+                 Rotor.Speed = coll.dat$rotor.speed[i],
+                 Pitch = coll.dat$rotor.pitch[i],
+                 speed = coll.dat$flight.speed[i],
+                 flapglide = "flap",
+                 birdlength = coll.dat$BirdLength[i],
+                 wingspan = coll.dat$wingspan[i], 
+                 FH.dat = FH.dat,
+                 Prop_Upwind = 0.5, coverC = coverC)
+  
+  list(out)
+  
+}
+
+
+stopCluster(cl)
+
+coll.dat$coll.int = coll.int.out[[1]][1,]
+
+## calculate the total flux through the rotor sweep zone and immediately above and below the rotor sweep zone
+coll.dat$flux.All = coll.dat$total.flux * (coll.dat$total.rotor.frontal.area/coll.dat$area.survey.window)
+
+## calculate the predicted number of collisions
+coll.dat$PredColl.NoAvoid.Opt3 = coll.dat$flux.All * coll.dat$coll.int
+
+
+```
+
+
+
+
+
+
+## 7. Summarise Extended band model avoidance rates for species and species groups
+
+These plots show the avoidance rates at the species level and some key groupings for the extended band model
+The confidence intervals here just represent the variation between data set rows in avoidance rates
+(a row can be one wind farm over multiple years, one wind farm over one season or 1 turbine within a wind farm)
+
+
+```{r Species-level-avoidance-extended-band, message=FALSE, warning=FALSE, include=FALSE}
+
+
+## Now calculate the avoidance rates for each unique value in the species column
+Extended.Band.Spp.Avoid = vector()
+Extended.Band.Spp.AvoidSD = vector()
+Extended.Band.Spp.AvoidUpCI = vector()
+Extended.Band.Spp.AvoidLowCI = vector()
+
+for(i in 1:length(spp)) {
+  
+  Extended.Band.Spp.Avoid[i] = 1-(sum(coll.dat$Estimated.Collisions[coll.dat$Species == spp[i]])/sum(coll.dat$PredColl.NoAvoid.Opt3[coll.dat$Species == spp[i]]))
+  Extended.Band.Spp.AvoidSD[i] = std.dev(coll.dat$Estimated.Collisions[coll.dat$Species == spp[i]], coll.dat$PredColl.NoAvoid.Opt3[coll.dat$Species == spp[i]])
+  Extended.Band.Spp.AvoidUpCI[i] = Extended.Band.Spp.Avoid[i] + (1.96 * Extended.Band.Spp.AvoidSD[i])
+  Extended.Band.Spp.AvoidLowCI[i] = Extended.Band.Spp.Avoid[i] - (1.96 * Extended.Band.Spp.AvoidSD[i])
+  
+}
+
+Extended.Band.Avoid.Spp.Table = data.frame(Species = spp, Avoidance = Extended.Band.Spp.Avoid, AvoidanceSD = Extended.Band.Spp.AvoidSD, AvoidanceLCL = Extended.Band.Spp.AvoidLowCI, AvoidanceUCL = Extended.Band.Spp.AvoidUpCI)
+
+
+
+
+```
+
+```{r Group-level-avoidance-extended-band, echo=FALSE, message=FALSE, warning=FALSE}
+
+
+## Now calculate the avoidance rates for each unique value in the species group column
+Extended.Band.Group.Avoid = vector()
+Extended.Band.Group.AvoidSD = vector()
+Extended.Band.Group.AvoidUpCI = vector()
+Extended.Band.Group.AvoidLowCI = vector()
+
+for(i in 1:length(group)) {
+  
+  Extended.Band.Group.Avoid[i] = 1-(sum(coll.dat$Estimated.Collisions[coll.dat$group == group[i]])/sum(coll.dat$PredColl.NoAvoid.Opt3[coll.dat$group == group[i]]))
+  Extended.Band.Group.AvoidSD[i] = std.dev(coll.dat$Estimated.Collisions[coll.dat$group == group[i]], coll.dat$PredColl.NoAvoid.Opt3[coll.dat$group == group[i]])
+  Extended.Band.Group.AvoidUpCI[i] = Extended.Band.Group.Avoid[i] + (1.96 * Extended.Band.Group.AvoidSD[i])
+  Extended.Band.Group.AvoidLowCI[i] = Extended.Band.Group.Avoid[i] - (1.96 * Extended.Band.Group.AvoidSD[i])
+  
+}
+
+Extended.Band.Group.Avoid[4] = 1-(sum(coll.dat$Estimated.Collisions[coll.dat$group %in% c("small gull", "large gull", "gull")])/sum(coll.dat$PredColl.NoAvoid.Opt3[coll.dat$group %in% c("small gull", "large gull", "gull")]))
+Extended.Band.Group.AvoidSD[4] = std.dev(coll.dat$Estimated.Collisions[coll.dat$group %in% c("small gull", "large gull", "gull")], coll.dat$PredColl.NoAvoid.Opt3[coll.dat$group  %in% c("small gull", "large gull", "gull")])
+Extended.Band.Group.AvoidUpCI[4] = Extended.Band.Group.Avoid[4] + (1.96 * Extended.Band.Group.AvoidSD[4])
+Extended.Band.Group.AvoidLowCI[4] = Extended.Band.Group.Avoid[4] - (1.96 * Extended.Band.Group.AvoidSD[4])
+
+
+Extended.Band.Avoid.Group.Table = data.frame(Species = group, Avoidance = Extended.Band.Group.Avoid, AvoidanceSD = Extended.Band.Group.AvoidSD, AvoidanceLCL = Extended.Band.Group.AvoidLowCI, AvoidanceUCL = Extended.Band.Group.AvoidUpCI)
+
+
+## Add data for all gulls and terns
+ExtBAvoid <- 1-(sum(coll.dat$Estimated.Collisions)/sum(coll.dat$PredColl.NoAvoid.Opt3))
+ExtBAvoidSD <- std.dev(coll.dat$Estimated.Collisions, coll.dat$PredColl.NoAvoid.Opt3)
+ExtBAvoidUpCI <- ExtBAvoid + (1.96 *ExtBAvoidSD)
+ExtBAvoidLowCI <- ExtBAvoid - (1.96 * ExtBAvoidSD)
+Extended.Band.Avoid.Group.Table$Species <- as.character(Extended.Band.Avoid.Group.Table$Species)
+Extended.Band.Avoid.Group.Table <- rbind(Extended.Band.Avoid.Group.Table, c("Gulls & terns", ExtBAvoid, ExtBAvoidSD, ExtBAvoidUpCI, ExtBAvoidLowCI))
+
+Extended.Band.Avoid.Group.Table = rbind(Extended.Band.Avoid.Spp.Table, Extended.Band.Avoid.Group.Table)
+
+Extended.Band.Avoid.Group.Table$Avoidance <- as.numeric(Extended.Band.Avoid.Group.Table$Avoidance)
+Extended.Band.Avoid.Group.Table$AvoidanceSD <- as.numeric(Extended.Band.Avoid.Group.Table$AvoidanceSD)
+Extended.Band.Avoid.Group.Table$AvoidanceLCL <- as.numeric(Extended.Band.Avoid.Group.Table$AvoidanceLCL)
+Extended.Band.Avoid.Group.Table$AvoidanceUCL <- as.numeric(Extended.Band.Avoid.Group.Table$AvoidanceUCL)
+Extended.Band.Avoid.Group.Table$ARs = paste(round(Extended.Band.Avoid.Group.Table[,2],4), " (",round(Extended.Band.Avoid.Group.Table[,3],4), "; ", round(Extended.Band.Avoid.Group.Table[,4],4), " - ", round(Extended.Band.Avoid.Group.Table[,5],4),")", sep = "") 
+
+## sometimes keep NAs in so going to remove thee row is species is NA
+Extended.Band.Avoid.Group.Table <- filter(Extended.Band.Avoid.Group.Table, Species %in% c("Gulls & terns", "tern", "little tern", "common tern", "sandwich tern", "small gull", "large gull", "gull", "great black-backed gull", "lesser black-backed gull", "herring gull", "black-headed gull", "common gull" ,"kittiwake"))
+
+
+
+
+## Now plot the avoidance rates and their CIs
+## filter out the species I want for this report
+ExtBand_group_avoidance <- Extended.Band.Avoid.Group.Table
+ExtBand_group_avoidance$Species <- as.character(ExtBand_group_avoidance$Species)
+ExtBand_group_avoidance$Species <- as.factor(ExtBand_group_avoidance$Species)
+
+## order the factgor so the group plot in the order I want
+ExtBand_group_avoidance$Species <- factor(ExtBand_group_avoidance$Species, levels = c("Gulls & terns", "tern", "little tern", "common tern", "sandwich tern", "small gull", "large gull", "gull", "great black-backed gull", "lesser black-backed gull", "herring gull", "black-headed gull", "common gull" ,"kittiwake"))
+
+
+## Save the data set for this plot
+#ExtBand_group_avoidance$Source <- "Cook (2021)"
+#write_csv(ExtBand_group_avoidance, file = "~/Turbine CRM analysis/Cook (2021) outputs/ExtBand_ARs_Cook.csv")
+
+
+## Read in the data set
+Cook_ExtBandAR <- read_csv("~/Turbine CRM analysis/Cook (2021) outputs/ExtBand_ARs_Cook.csv")
+Cook_ExtBandAR$ARs = paste(round(Cook_ExtBandAR$Avoidance,4), " (",round(Cook_ExtBandAR$AvoidanceSD,4), "; ", round(Cook_ExtBandAR$AvoidanceLCL,4), " - ", round(Cook_ExtBandAR$AvoidanceUCL,4),")", sep = "") 
+
+
+
+```
+
+
+```{r Group-level-avoidance-extended-band-plotting, echo=FALSE, message=FALSE, warning=FALSE}
+
+## Bind together my data set and the cook data set
+ExtBand_group_avoidance$Source <- "Ozsanlav-Harris et al (2022)"
+AllExtBand_ARs <- rbind(ExtBand_group_avoidance, Cook_ExtBandAR)
+
+
+## Filter out the species I want and then alter the species names
+AllExtBand_ARs <- filter(AllExtBand_ARs, Species %in% c("Gulls & terns", "tern", "sandwich tern", "small gull", "large gull", "gull", 
+                                                            "great black-backed gull", "lesser black-backed gull", "herring gull", "black-headed gull" ,"kittiwake"))
+AllExtBand_ARs$Species <- as.character(AllExtBand_ARs$Species)
+AllExtBand_ARs$Species <- paste(toupper(substr(AllExtBand_ARs$Species, 1, 1)), substr(AllExtBand_ARs$Species, 2, nchar(AllExtBand_ARs$Species)), sep="")
+
+AllExtBand_ARs$Species <- factor(AllExtBand_ARs$Species, levels = c("Gulls & terns", "Tern", "Sandwich tern", "Small gull", "Large gull", "Gull", 
+                                                                        "Great black-backed gull", "Lesser black-backed gull", "Herring gull", "Black-headed gull" ,"Kittiwake"))
+
+
+
+pd<- position_dodge(0.7)
+ggplot(AllExtBand_ARs, aes(x= Species, y = Avoidance, colour = Source))+
+  geom_point(aes(color = Source), position = pd)+
+  geom_errorbar(aes(ymin=AvoidanceLCL, ymax=AvoidanceUCL, colour= Source), position=pd, width=0.5) +
+  coord_flip() +
+  theme_bw() +
+  scale_colour_manual(values=c("#0072B2", "#D55E00")) +
+  ylab("Extended Band avoidance rate") + xlab("Species/Species group") +
+  theme(panel.grid.major.y = element_blank(), panel.grid.minor.y = element_blank(), 
+        axis.text=element_text(size=10), axis.title=element_text(size=14, face = "bold"), 
+        plot.title = element_text(size=12, face="bold"), panel.grid.minor.x = element_blank())
+
+
+## Read in or save the plots from Cook 2021
+setwd("~/Turbine CRM analysis/OH et al (2022) plots")
+## Save a plot
+#ggsave("ExtBand_SpeciesGroup.png", 
+#       width = 28, height = 15, units = "cm")
+
+
+
+
+## Now read in the Cook 2021 data
+Cook_ExtBandAR <- read_csv("~/Turbine CRM analysis/Cook (2021) outputs/ExtBand_ARs_Cook.csv")
+Cook_ExtBandAR$ARs = paste(round(Cook_ExtBandAR$Avoidance,4), " (",round(Cook_ExtBandAR$AvoidanceSD,4), "; ", round(Cook_ExtBandAR$AvoidanceLCL,4), " - ", round(Cook_ExtBandAR$AvoidanceUCL,4),")", sep = "") 
+
+## Create a table for the ARs
+Cook_ExtBandAR$AR_2020 <- ExtBand_group_avoidance$ARs
+Cook_ExtBandAR$dif <- ((ExtBand_group_avoidance$Avoidance-Cook_ExtBandAR$Avoidance)/Cook_ExtBandAR$Avoidance)*100
+colnames(Cook_ExtBandAR)
+TableExtARs <- subset(Cook_ExtBandAR, select = c("Species", "ARs", "AR_2020", "dif"))
+TableExtARs <- filter(TableExtARs, Species %in% c("Gulls & terns", "tern", "sandwich tern", "small gull", "large gull", "gull", 
+                                                      "great black-backed gull", "lesser black-backed gull", "herring gull", "black-headed gull" ,"kittiwake"))
+data.table::setnames(TableExtARs, old = c("Species", "ARs", "AR_2020", "dif"), 
+                     new = c("Species/Species group", "Cook (2021)", "Ozsanlav-Harris et al (2022)", "% change in rate"))
+
+TableExtARs$`Species/Species group` <- as.character(TableExtARs$`Species/Species group`)
+TableExtARs$`Species/Species group` <- paste(toupper(substr(TableExtARs$`Species/Species group`, 1, 1)), substr(TableExtARs$`Species/Species group`, 2, nchar(TableExtARs$`Species/Species group`)), sep="")
+
+TableExtARs$`Species/Species group` <- factor(TableExtARs$`Species/Species group`, levels = c("Gulls & terns", "Tern", "Sandwich tern", "Small gull", "Large gull", "Gull", 
+                                                                                                  "Great black-backed gull", "Lesser black-backed gull", "Herring gull", "Black-headed gull" ,"Kittiwake"))
+
+
+
+## Create the table suing Formattable
+TableExtARs <- TableExtARs[c(5,1,3,2,4,10,8,7,6,9,11),]
+TableExtARs$`% change in rate` <- round(TableExtARs$`% change in rate`, digits = 3)
+customGreen = "#71CA97"
+customRed = "#ff7f7f"
+improvement_formatter <- formatter("span", 
+                                   style = x ~ style(font.weight = "bold", 
+                                                     color = ifelse(x > 0, customGreen, ifelse(x < 0, customRed, "black"))), 
+                                   x ~ icontext(ifelse(x>0, "arrow-up", ifelse(x < 0, "arrow-down", "equal")), x)
+)
+
+ExtTable <- formattable(TableExtARs, align =c("l","c","c", "c"),
+                        list(
+  `Species/Species group` = formatter("span", style = ~ style(color = "grey", font.weight = "bold")), 
+  `% change in rate`= improvement_formatter
+))
+
+
+
+w <- as.htmlwidget(ExtTable, width = 1250, height = 500)
+path <- html_print(w, background = "white", viewer = NULL)
+url <- paste0("file:///", gsub("\\\\", "/", normalizePath(path)))
+
+setwd("~/Turbine CRM analysis/OH et al (2022) plots")
+outputpath <- paste0("ExtBandAR_", " table", ".png")
+
+#webshot::webshot(url = url, file = outputpath, 
+#                vwidth = 1250, vheight = 500)
+
+
+
+
+```
+
+
+
+
+------
+
+
+## 8. Calculate predicted number of collisions for the stochastic basic Band model 
+This gives confidence intervals for the avoidance rates by allowing some of the input parameters to vary for the basic band model
+
+```{r Stochastic-band-predicted-collions}
+
+
+## Now for the stochastic avoidance rates
+## First step is to simulate the number of birds passing through the rotor swept areas
+
+##  Now need to work out the number of birds passing through each wind farm during the study period
+nsim = 1000
+
+flux.dat = matrix(nrow = nrow(coll.dat), ncol = nsim)
+
+### for sites where we already have total flux (e.g. Oosterbierum)
+
+flux.dat[!is.na(coll.dat$total.flux),] = coll.dat$total.flux[!is.na(coll.dat$total.flux)]
+
+### For sites where we have  a number of birds recorded and a number of hours monitoring
+
+coll.dat$passage.rate[!is.na(coll.dat$Number.of.birds.recorded)] = coll.dat$Number.of.birds.recorded[!is.na(coll.dat$Number.of.birds.recorded)]/coll.dat$N.Hours.monitoring[!is.na(coll.dat$Number.of.birds.recorded)]
+
+for(i in 1:nrow(coll.dat[!is.na(coll.dat$passage.rate),])) {
+  
+  nbirds.pass = rpois(nsim,coll.dat$passage.rate[!is.na(coll.dat$passage.rate)][i]) 
+  
+  flux.dat[!is.na(coll.dat$passage.rate),] [i,]=  (nbirds.pass * coll.dat$HoursNight[!is.na(coll.dat$passage.rate)][[i]]  * coll.dat$Nocturnal.Correction[!is.na(coll.dat$passage.rate)] [i]) + (nbirds.pass * coll.dat$HoursDay[!is.na(coll.dat$passage.rate)] [[i]]) 
+  
+}
+
+## get total number of flights through rotor sweep NOT adjusted for proportion at risk height
+
+for(i in 1:ncol(flux.dat)) { flux.dat[,i] = flux.dat[,i] / coll.dat$area.survey.window * coll.dat$total.rotor.frontal.area }
+
+### Do the same for sites where bird data are availabile as densities rather than counts
+
+for(i in 1:nrow(flux.dat[!is.na(coll.dat$density),])) {
+  
+  flux.dat[!is.na(coll.dat$density),][i,] = (3600/(coll.dat$width.of.survey.area[!is.na(coll.dat$density)][i]/rtruncnorm(n = nsim, a = 4, coll.dat$flight.speed[!is.na(coll.dat$density)][i]))) * coll.dat$HoursDay[!is.na(coll.dat$density)][i] * (rpois(nsim, coll.dat$density[!is.na(coll.dat$density)][i]) * coll.dat$Survey.area[!is.na(coll.dat$density)][i])
+  
+  
+}
+
+## We now have 1000 estimates of the number of birds passing through turbine rotors, need to correct for PCH and probability of collision
+## Now work out the probability of collision at each site
+## vectors needed for the Band model
+
+##### now simulate Pcoll
+
+Pcoll.dat = matrix(nrow = nrow(coll.dat), ncol = nsim)
+
+for(i in 1:nrow(Pcoll.dat)) {
+  for(y in 1:ncol(Pcoll.dat)){
+    
+    simRotorSpeed = rnorm(1,coll.dat$rotor.speed[i],0.5)
+    simRotorPitch = rnorm(1,coll.dat$rotor.pitch[i],0.1)
+    simBodyLength = rnorm(1, coll.dat$BirdLength[i], coll.dat$BirdLengthSD[i])
+    simWingspan = rnorm(1, coll.dat$wingspan[i], coll.dat$wingspanSD[i])
+    simFlightSpeed = rtruncnorm(n = 1,a = 4, mean = coll.dat$flight.speed[i], sd = coll.dat$flightspeedSD[i])
+    
+    Pcoll.dat[i,y] = pcoll(k =1, no.blades = 3, max.chord = coll.dat$blade.width[i], pitch = simRotorPitch, rotor.rad = coll.dat$rotor.diameter[i]/2, rotor.period = 60/simRotorSpeed,wingspan = simWingspan, bird.length = simBodyLength, aspect = simBodyLength/simWingspan, flap.glide = 0, bird.speed = simFlightSpeed,prop.flights.upwind = 0.5,radius,chord)
+    
+  }}
+
+### now estimate collisions in the absence of avoidance
+
+coll.no.avoid = matrix(nrow = nrow(coll.dat), ncol = nsim)
+
+for( i in 1:ncol(coll.no.avoid)){  coll.no.avoid[,i] = Pcoll.dat[,i] * flux.dat[,i] * coll.dat$X..flights.at.rotor.height  }
+
+
+```
+
+
+
+
+
+
+## 9. Summarise stochastic basic band model avoidance rates for species and species groups
+```{r Species-level-avoidance-stochastic-basic-band, echo=FALSE, message=FALSE, warning=FALSE}
+
+
+## now bootstrapped avoidance rates
+
+HG.Basic.sCRM.Avoid = vector()
+LB.Basic.sCRM.Avoid = vector()
+GB.Basic.sCRM.Avoid = vector()
+KI.Basic.sCRM.Avoid = vector()
+BH.Basic.sCRM.Avoid = vector()
+CG.Basic.sCRM.Avoid = vector()
+LT.Basic.sCRM.Avoid = vector()
+ST.Basic.sCRM.Avoid = vector()
+CT.Basic.sCRM.Avoid = vector()
+SG.Basic.sCRM.Avoid = vector()
+LG.Basic.sCRM.Avoid = vector()
+AG.Basic.sCRM.Avoid = vector()
+AT.Basic.sCRM.Avoid = vector()
+ALL.Basic.sCRM.Avoid = vector()
+
+for (i in 1:ncol(coll.no.avoid)){
+  
+  HG.Basic.sCRM.Avoid[i] = 1-(sum(coll.dat$Estimated.Collisions[coll.dat$Species == "herring gull"])/sum(coll.no.avoid[coll.dat$Species == "herring gull", i]))
+  LB.Basic.sCRM.Avoid[i] = 1-(sum(coll.dat$Estimated.Collisions[coll.dat$Species == "lesser black-backed gull"])/sum(coll.no.avoid[coll.dat$Species == "lesser black-backed gull", i]))
+  GB.Basic.sCRM.Avoid[i] = 1-(sum(coll.dat$Estimated.Collisions[coll.dat$Species == "great black-backed gull"])/sum(coll.no.avoid[coll.dat$Species == "great black-backed gull", i]))
+  KI.Basic.sCRM.Avoid[i] = 1-(sum(coll.dat$Estimated.Collisions[coll.dat$Species == "kittiwake"])/sum(coll.no.avoid[coll.dat$Species == "kittiwake", i]))
+  BH.Basic.sCRM.Avoid[i] = 1-(sum(coll.dat$Estimated.Collisions[coll.dat$Species == "black-headed gull"])/sum(coll.no.avoid[coll.dat$Species == "black-headed gull", i]))
+  CG.Basic.sCRM.Avoid[i] = 1-(sum(coll.dat$Estimated.Collisions[coll.dat$Species == "common gull"])/sum(coll.no.avoid[coll.dat$Species == "common gull", i]))
+  LT.Basic.sCRM.Avoid[i] = 1-(sum(coll.dat$Estimated.Collisions[coll.dat$Species == "little tern"])/sum(coll.no.avoid[coll.dat$Species == "little tern", i]))
+  ST.Basic.sCRM.Avoid[i] = 1-(sum(coll.dat$Estimated.Collisions[coll.dat$Species == "sandwich tern"])/sum(coll.no.avoid[coll.dat$Species == "sandwich tern", i]))
+  CT.Basic.sCRM.Avoid[i] = 1-(sum(coll.dat$Estimated.Collisions[coll.dat$Species == "common tern"])/sum(coll.no.avoid[coll.dat$Species == "common tern", i]))
+  SG.Basic.sCRM.Avoid[i] = 1-(sum(coll.dat$Estimated.Collisions[coll.dat$group == "small gull"])/sum(coll.no.avoid[coll.dat$group == "small gull", i]))
+  LG.Basic.sCRM.Avoid[i] = 1-(sum(coll.dat$Estimated.Collisions[coll.dat$group == "large gull"])/sum(coll.no.avoid[coll.dat$group == "large gull", i]))
+  AG.Basic.sCRM.Avoid[i] = 1-(sum(coll.dat$Estimated.Collisions[coll.dat$group %in% c("large gull", "small gull", "gull")])/sum(coll.no.avoid[coll.dat$group %in% c("gull","large gull", "small gull"), i]))
+  AT.Basic.sCRM.Avoid[i] = 1-(sum(coll.dat$Estimated.Collisions[coll.dat$group == "tern"])/sum(coll.no.avoid[coll.dat$group == "tern", i]))
+  
+  ALL.Basic.sCRM.Avoid[i] = 1-(sum(coll.dat$Estimated.Collisions)/sum(coll.no.avoid[,i]))
+  
+}
+
+
+
+
+Basic.sCRM.Avoid.Table = data.frame(Species = c("Herring Gull", "Lesser Black-backed Gull", "Great Black-Backed Gull", "Kittiwake", "Black-headed Gull", "Common Gull", "Little Tern", "Sandwich Tern", "Common Tern", "Small Gull", "Large Gull", "All Gull", "All Tern", "Gulls & terns"), 
+                                    Avoidance = c(median(HG.Basic.sCRM.Avoid),median(LB.Basic.sCRM.Avoid),median(GB.Basic.sCRM.Avoid),median(KI.Basic.sCRM.Avoid[KI.Basic.sCRM.Avoid >0]),median(BH.Basic.sCRM.Avoid), median(CG.Basic.sCRM.Avoid),median(LT.Basic.sCRM.Avoid), median(ST.Basic.sCRM.Avoid),median(CT.Basic.sCRM.Avoid),median(SG.Basic.sCRM.Avoid),median(LG.Basic.sCRM.Avoid),median(AG.Basic.sCRM.Avoid),median(AT.Basic.sCRM.Avoid), median(ALL.Basic.sCRM.Avoid)),
+                                    AvoidanceSD = c(sd(HG.Basic.sCRM.Avoid),sd(LB.Basic.sCRM.Avoid),sd(GB.Basic.sCRM.Avoid),sd(KI.Basic.sCRM.Avoid[KI.Basic.sCRM.Avoid >0]),sd(BH.Basic.sCRM.Avoid), sd(CG.Basic.sCRM.Avoid),sd(LT.Basic.sCRM.Avoid), sd(ST.Basic.sCRM.Avoid),sd(CT.Basic.sCRM.Avoid),sd(SG.Basic.sCRM.Avoid),sd(LG.Basic.sCRM.Avoid),sd(AG.Basic.sCRM.Avoid),sd(AT.Basic.sCRM.Avoid), sd(ALL.Basic.sCRM.Avoid, na.rm = T)),
+                                    AvoidanceLCL = c(quantile(HG.Basic.sCRM.Avoid, 0.025),quantile(LB.Basic.sCRM.Avoid, 0.025),quantile(GB.Basic.sCRM.Avoid, 0.025),quantile(KI.Basic.sCRM.Avoid[KI.Basic.sCRM.Avoid >0], 0.025),quantile(BH.Basic.sCRM.Avoid, 0.025),quantile(CG.Basic.sCRM.Avoid, 0.025),quantile(LT.Basic.sCRM.Avoid, 0.025),quantile(ST.Basic.sCRM.Avoid, 0.025),quantile(CT.Basic.sCRM.Avoid, 0.025),quantile(SG.Basic.sCRM.Avoid, 0.025),quantile(LG.Basic.sCRM.Avoid, 0.025),quantile(AG.Basic.sCRM.Avoid, 0.025),quantile(AT.Basic.sCRM.Avoid, 0.025), quantile(ALL.Basic.sCRM.Avoid, 0.025)), 
+                                    AvoidanceUCL = c(quantile(HG.Basic.sCRM.Avoid, 0.975),quantile(LB.Basic.sCRM.Avoid, 0.975),quantile(GB.Basic.sCRM.Avoid, 0.975),quantile(KI.Basic.sCRM.Avoid[KI.Basic.sCRM.Avoid >0], 0.975),quantile(BH.Basic.sCRM.Avoid, 0.975),quantile(CG.Basic.sCRM.Avoid, 0.975),quantile(LT.Basic.sCRM.Avoid, 0.975),quantile(ST.Basic.sCRM.Avoid, 0.975),quantile(CT.Basic.sCRM.Avoid, 0.975),quantile(SG.Basic.sCRM.Avoid, 0.975),quantile(LG.Basic.sCRM.Avoid, 0.975),quantile(AG.Basic.sCRM.Avoid, 0.975),quantile(AT.Basic.sCRM.Avoid, 0.975), quantile(ALL.Basic.sCRM.Avoid, 0.975)))
+
+
+Basic.sCRM.Avoid.Table$ARs = paste(round(Basic.sCRM.Avoid.Table[,2],4), " (",round(Basic.sCRM.Avoid.Table[,3],4), "; ", round(Basic.sCRM.Avoid.Table[,4],4), " - ", round(Basic.sCRM.Avoid.Table[,5],4),")", sep = "") 
+
+
+
+## Now plot the avoidance rates and their CIs
+## filter out the species I want for this report
+BasicBandSt_group_avoidance <- Basic.sCRM.Avoid.Table
+BasicBandSt_group_avoidance$Species <- as.character(BasicBandSt_group_avoidance$Species)
+BasicBandSt_group_avoidance$Species <- as.factor(BasicBandSt_group_avoidance$Species)
+
+## order the factgor so the group plot in the order I want
+BasicBandSt_group_avoidance$Species <- factor(BasicBandSt_group_avoidance$Species, levels = c("Gulls & terns", "All Tern", "Little Tern", "Common Tern", "Sandwich Tern", "Small Gull", "Large Gull", "All Gull", "Great Black-Backed Gull", "Lesser Black-backed Gull", "Herring Gull", "Black-headed Gull", "Common Gull" ,"Kittiwake"))
+
+
+
+## Save the data set for this plot
+#BasicBandSt_group_avoidance$Source <- "Cook (2021)"
+#write_csv(BasicBandSt_group_avoidance, file = "~/Turbine CRM analysis/Cook (2021) outputs/StBasicBand_ARs_Cook.csv")
+
+## Read in the data set
+Cook_StBasicBandAR <- read_csv("~/Turbine CRM analysis/Cook (2021) outputs/StBasicBand_ARs_Cook.csv")
+Cook_StBasicBandAR$ARs = paste(round(Cook_StBasicBandAR$Avoidance,4), " (",round(Cook_StBasicBandAR$AvoidanceSD,4), "; ", round(Cook_StBasicBandAR$AvoidanceLCL,4), " - ", round(Cook_StBasicBandAR$AvoidanceUCL,4),")", sep = "") 
+
+
+
+```
+
+``` {r Group-level-avoidance-StBasic-band-plotting, echo=FALSE, message=FALSE, warning=FALSE}
+
+
+
+## Bind together my data set and the cook data set
+BasicBandSt_group_avoidance$Source <- "Ozsanlav-Harris et al (2022)"
+AllSt_BasicBand_ARs <- rbind(BasicBandSt_group_avoidance, Cook_StBasicBandAR)
+unique(AllSt_BasicBand_ARs$Species)
+## Filter out the species I want and then alter the species names
+AllSt_BasicBand_ARs <- filter(AllSt_BasicBand_ARs, Species %in% c("Herring Gull", "Lesser Black-backed Gull", "Great Black-Backed Gull", "Kittiwake", "Black-headed Gull", "Sandwich Tern", "Small Gull", "Large Gull", "All Gull", "All Tern", "Gulls & terns"))
+AllSt_BasicBand_ARs$Species <- as.character(AllSt_BasicBand_ARs$Species)
+AllSt_BasicBand_ARs$Species <- paste(toupper(substr(AllSt_BasicBand_ARs$Species, 1, 1)), substr(AllSt_BasicBand_ARs$Species, 2, nchar(AllSt_BasicBand_ARs$Species)), sep="")
+
+AllSt_BasicBand_ARs$Species <- factor(AllSt_BasicBand_ARs$Species, levels = c("Gulls & terns", "All Tern", "Sandwich Tern", "Small Gull", "Large Gull", "All Gull", 
+                                                                        "Great Black-Backed Gull", "Lesser Black-backed Gull", "Herring Gull", "Black-headed Gull" ,"Kittiwake"))
+
+
+
+pd<- position_dodge(0.7)
+ggplot(AllSt_BasicBand_ARs, aes(x= Species, y = Avoidance, colour = Source))+
+  geom_point(aes(color = Source), position = pd)+
+  geom_errorbar(aes(ymin=AvoidanceLCL, ymax=AvoidanceUCL, colour= Source), position=pd, width=0.5) +
+  coord_flip() +
+  theme_bw() +
+  scale_colour_manual(values=c("#0072B2", "#D55E00")) +
+  ylab("Stochastic Basic Band avoidance rate") + xlab("Species/Species group") +
+  theme(panel.grid.major.y = element_blank(), panel.grid.minor.y = element_blank(), 
+        axis.text=element_text(size=10), axis.title=element_text(size=14, face = "bold"), 
+        plot.title = element_text(size=12, face="bold"), panel.grid.minor.x = element_blank())
+
+## Read in or save the plots from Cook 2021
+setwd("~/Turbine CRM analysis/OH et al (2022) plots")
+## Save a plot
+#ggsave("BasicBandSt_SpeciesGroup.png", 
+#        width = 28, height = 15, units = "cm")
+
+
+
+
+## Read in the data set
+Cook_StBasicBandAR <- read_csv("~/Turbine CRM analysis/Cook (2021) outputs/StBasicBand_ARs_Cook.csv")
+Cook_StBasicBandAR$ARs = paste(round(Cook_StBasicBandAR$Avoidance,4), " (",round(Cook_StBasicBandAR$AvoidanceSD,4), "; ", round(Cook_StBasicBandAR$AvoidanceLCL,4), " - ", round(Cook_StBasicBandAR$AvoidanceUCL,4),")", sep = "") 
+
+## Create a table for the ARs
+Cook_StBasicBandAR$AR_2020 <- BasicBandSt_group_avoidance$ARs
+Cook_StBasicBandAR$dif <- ((BasicBandSt_group_avoidance$Avoidance-Cook_StBasicBandAR$Avoidance)/Cook_StBasicBandAR$Avoidance)*100
+colnames(Cook_StBasicBandAR)
+TableStBasicARs <- subset(Cook_StBasicBandAR, select = c("Species", "ARs", "AR_2020", "dif"))
+data.table::setnames(TableStBasicARs, old = c("Species", "ARs", "AR_2020", "dif"), 
+                     new = c("Species/Species group", "Cook (2021)", "Ozsanlav-Harris et al (2022)", "% change in rate"))
+TableStBasicARs <- filter(TableStBasicARs, `Species/Species group` %in% c("Herring Gull", "Lesser Black-backed Gull", "Great Black-Backed Gull", "Kittiwake", "Black-headed Gull", "Sandwich Tern", "Small Gull", "Large Gull", "All Gull", "All Tern", "Gulls & terns"))
+
+## Create the table using Formattable
+TableStBasicARs <- TableStBasicARs[c(4,5,1,2,3,9,8,7,6,10,11),]
+TableStBasicARs$`% change in rate` <- round(TableStBasicARs$`% change in rate`, digits = 3)
+customGreen = "#71CA97"
+customRed = "#ff7f7f"
+improvement_formatter <- formatter("span", 
+                                   style = x ~ style(font.weight = "bold", 
+                                                     color = ifelse(x > 0, customGreen, ifelse(x < 0, customRed, "black"))), 
+                                   x ~ icontext(ifelse(x>0, "arrow-up", ifelse(x < 0, "arrow-down", "equal")), x)
+)
+
+StBasicTable <- formattable(TableStBasicARs, align =c("l","c","c", "c"), list(
+  `Species/Species group` = formatter("span", style = ~ style(color = "grey", font.weight = "bold")), 
+  `% change in rate`= improvement_formatter
+))
+
+
+
+w <- as.htmlwidget(StBasicTable, width = 1250, height = 500)
+path <- html_print(w, background = "white", viewer = NULL)
+url <- paste0("file:///", gsub("\\\\", "/", normalizePath(path)))
+
+setwd("~/Turbine CRM analysis/OH et al (2022) plots")
+outputpath <- paste0("StBasicBandAR_", " table", ".png")
+
+#webshot::webshot(url = url, file = outputpath, 
+#                 vwidth = 1250, vheight = 500)
+
+
+```
+
+
+
+------
+
+
+## 10. Calculate predicted number of collisions for the stochastic extended Band model 
+This gives confidence intervals for the avoidance rates by allowing some of the input parameters to vary for the extended band model
+
+```{r Stochastic-extended-band-predicted-collions}
+
+
+
+if(nrow(coll.dat) >= detectCores()) cl <- makeCluster(detectCores())
+if(nrow(coll.dat) < detectCores()) cl = makeCluster(niter)
+
+registerDoParallel(cl)
+
+coll.int.out2 = foreach(z = 1:nsim, .combine = "comb") %dopar% {
+  
+  out = vector()
+  
+  for(i in 1:nrow(coll.dat)){
+    
+    fh.dist.sample = sample(seq(2,201,1),1)
+    
+    if(coll.dat$Species.for.Flight.Height.Distribution[i] == "BlackHeadedGull") FH.dat = BH.boot[,fh.dist.sample]
+    if(coll.dat$Species.for.Flight.Height.Distribution[i] == "CommonGull") FH.dat = CG.boot[,fh.dist.sample]
+    if(coll.dat$Species.for.Flight.Height.Distribution[i] == "LesserBlackBackedGull") FH.dat = LB.boot[,fh.dist.sample]
+    if(coll.dat$Species.for.Flight.Height.Distribution[i] == "HerringGull") FH.dat = HG.boot[,fh.dist.sample]
+    if(coll.dat$Species.for.Flight.Height.Distribution[i] == "GreatBlackBackedGull") FH.dat = GB.boot[,fh.dist.sample]
+    if(coll.dat$Species.for.Flight.Height.Distribution[i] == "Kittiwake") FH.dat = KI.boot[,fh.dist.sample]
+    if(coll.dat$Species.for.Flight.Height.Distribution[i] == "SandwichTern") FH.dat = NE.boot[,fh.dist.sample]
+    if(coll.dat$Species.for.Flight.Height.Distribution[i] == "LittleGull") FH.dat = LG.boot[,fh.dist.sample]
+    if(coll.dat$Species.for.Flight.Height.Distribution[i] == "CommonTern") FH.dat = CT.boot[,fh.dist.sample]
+    
+    height = coll.dat$hub.height[i] + (HD.y * (coll.dat$rotor.diameter[i]/2))
+    HD.d.y = (((height-floor(height)) * (FH.dat[ceiling(height)+1] - FH.dat[floor(height)+1])) + FH.dat[floor(height)+1]) * coll.dat$rotor.diameter[i]/2
+    FluxMin = HD.d.y[1] * (2 * ((1 - HD.y[1] * HD.y[1])^0.5)) / 2 ### risk at lowest point on rotor blade
+    FluxInt = FluxMin + HD.d.y[41] * (2 * ((1 - HD.y[41] * HD.y[41])^0.5)) / 2 ### risk at highest point on rotor blade
+    for (zz in 2:40) { FluxInt = FluxInt + HD.d.y[zz] * (2 * ((1 - HD.y[zz] * HD.y[zz])^0.5)) } #### Fill in intermediate heights
+    FluxInt = FluxInt * 0.05 * (2/pi)
+    
+    
+    out[i] =coll.int(	HD.y = HD.y, HD.d.y = HD.d.y, FluxInt = FluxInt,
+                      Blades = 3, 
+                      HubHeight =  coll.dat$hub.height[i], 
+                      Rotor.Diameter = coll.dat$rotor.diameter[i], 
+                      Blade.Width = coll.dat$blade.width[i], 
+                      Rotor.Speed = rnorm(1,coll.dat$rotor.speed[i],0.5),
+                      Pitch = rnorm(1, coll.dat$rotor.pitch[i],0.1),
+                      speed = rnorm(1, coll.dat$flight.speed[i],coll.dat$flightspeedSD[i]),
+                      flapglide = "flap",
+                      birdlength = rnorm(1, coll.dat$BirdLength[i],coll.dat$BirdLengthSD[i]),
+                      wingspan = rnorm(1, coll.dat$wingspan[i],coll.dat$wingspanSD[i]), 
+                      FH.dat = FH.dat,
+                      Prop_Upwind = 0.5, coverC = coverC)
+    
+  }
+  list(out)
+  
+}
+
+write.csv(coll.int.out2[[1]], "CollIntSim.csv")
+
+
+### now estimate collisions in the absence of avoidance
+
+coll.no.avoid.Opt3 = matrix(nrow = nrow(coll.dat), ncol = nsim)
+
+for( i in 1:ncol(coll.no.avoid.Opt3)){  coll.no.avoid.Opt3[,i] = coll.int.out2[[1]][,i] * flux.dat[,i]  }
+
+```
+
+
+
+
+
+
+## 11. Summarise stochastic extended band model avoidance rates for species and species groups
+```{r Species-level-avoidance-stochastic-ext-band, echo=FALSE, message=FALSE, warning=FALSE}
+
+
+HG.Extended.sCRM.Avoid = vector()
+LB.Extended.sCRM.Avoid = vector()
+GB.Extended.sCRM.Avoid = vector()
+KI.Extended.sCRM.Avoid = vector()
+BH.Extended.sCRM.Avoid = vector()
+CG.Extended.sCRM.Avoid = vector()
+LT.Extended.sCRM.Avoid = vector()
+ST.Extended.sCRM.Avoid = vector()
+CT.Extended.sCRM.Avoid = vector()
+SG.Extended.sCRM.Avoid = vector()
+LG.Extended.sCRM.Avoid = vector()
+AG.Extended.sCRM.Avoid = vector()
+AT.Extended.sCRM.Avoid = vector()
+ALL.Extended.sCRM.Avoid = vector()
+
+for (i in 1:ncol(coll.no.avoid.Opt3)){
+  
+  HG.Extended.sCRM.Avoid[i] = 1-(sum(coll.dat$Estimated.Collisions[coll.dat$Species == "herring gull"])/sum(coll.no.avoid.Opt3[coll.dat$Species == "herring gull", i]))
+  LB.Extended.sCRM.Avoid[i] = 1-(sum(coll.dat$Estimated.Collisions[coll.dat$Species == "lesser black-backed gull"])/sum(coll.no.avoid.Opt3[coll.dat$Species == "lesser black-backed gull", i]))
+  GB.Extended.sCRM.Avoid[i] = 1-(sum(coll.dat$Estimated.Collisions[coll.dat$Species == "great black-backed gull"])/sum(coll.no.avoid.Opt3[coll.dat$Species == "great black-backed gull", i]))
+  KI.Extended.sCRM.Avoid[i] = 1-(sum(coll.dat$Estimated.Collisions[coll.dat$Species == "kittiwake"])/sum(coll.no.avoid.Opt3[coll.dat$Species == "kittiwake", i]))
+  BH.Extended.sCRM.Avoid[i] = 1-(sum(coll.dat$Estimated.Collisions[coll.dat$Species == "black-headed gull"])/sum(coll.no.avoid.Opt3[coll.dat$Species == "black-headed gull", i]))
+  CG.Extended.sCRM.Avoid[i] = 1-(sum(coll.dat$Estimated.Collisions[coll.dat$Species == "common gull"])/sum(coll.no.avoid.Opt3[coll.dat$Species == "common gull", i]))
+  LT.Extended.sCRM.Avoid[i] = 1-(sum(coll.dat$Estimated.Collisions[coll.dat$Species == "little tern"])/sum(coll.no.avoid.Opt3[coll.dat$Species == "little tern", i]))
+  ST.Extended.sCRM.Avoid[i] = 1-(sum(coll.dat$Estimated.Collisions[coll.dat$Species == "sandwich tern"])/sum(coll.no.avoid.Opt3[coll.dat$Species == "sandwich tern", i]))
+  CT.Extended.sCRM.Avoid[i] = 1-(sum(coll.dat$Estimated.Collisions[coll.dat$Species == "common tern"])/sum(coll.no.avoid.Opt3[coll.dat$Species == "common tern", i]))
+  SG.Extended.sCRM.Avoid[i] = 1-(sum(coll.dat$Estimated.Collisions[coll.dat$group == "small gull"])/sum(coll.no.avoid.Opt3[coll.dat$group == "small gull", i]))
+  LG.Extended.sCRM.Avoid[i] = 1-(sum(coll.dat$Estimated.Collisions[coll.dat$group == "large gull"])/sum(coll.no.avoid.Opt3[coll.dat$group == "large gull", i]))
+  AG.Extended.sCRM.Avoid[i] = 1-(sum(coll.dat$Estimated.Collisions[coll.dat$group %in% c("large gull", "small gull", "gull")])/sum(coll.no.avoid.Opt3[coll.dat$group %in% c("gull","large gull", "small gull"), i]))
+  AT.Extended.sCRM.Avoid[i] = 1-(sum(coll.dat$Estimated.Collisions[coll.dat$group == "tern"])/sum(coll.no.avoid.Opt3[coll.dat$group == "tern", i]))
+  ALL.Extended.sCRM.Avoid[i] =  1-(sum(coll.dat$Estimated.Collisions)/sum(coll.no.avoid.Opt3[,i]))
+  
+}
+
+
+
+
+Extended.sCRM.Avoid.Table = data.frame(Species = c("Herring Gull", "Lesser Black-backed Gull", "Great Black-Backed Gull", "Kittiwake", "Black-headed Gull", "Common Gull", "Little Tern", "Sandwich Tern", "Common Tern", "Small Gull", "Large Gull", "All Gull", "All Tern", "Gulls & terns"), 
+                                       Avoidance = c(median(HG.Extended.sCRM.Avoid),median(LB.Extended.sCRM.Avoid),median(GB.Extended.sCRM.Avoid),median(KI.Extended.sCRM.Avoid[KI.Extended.sCRM.Avoid >0]),median(BH.Extended.sCRM.Avoid), median(CG.Extended.sCRM.Avoid),median(LT.Extended.sCRM.Avoid), median(ST.Extended.sCRM.Avoid),median(CT.Extended.sCRM.Avoid),median(SG.Extended.sCRM.Avoid),median(LG.Extended.sCRM.Avoid),median(AG.Extended.sCRM.Avoid),median(AT.Extended.sCRM.Avoid), median(ALL.Extended.sCRM.Avoid)),
+                                       AvoidanceSD = c(sd(HG.Extended.sCRM.Avoid),sd(LB.Extended.sCRM.Avoid),sd(GB.Extended.sCRM.Avoid),sd(KI.Extended.sCRM.Avoid[KI.Extended.sCRM.Avoid >0]),sd(BH.Extended.sCRM.Avoid), sd(CG.Extended.sCRM.Avoid),sd(LT.Extended.sCRM.Avoid), sd(ST.Extended.sCRM.Avoid),sd(CT.Extended.sCRM.Avoid),sd(SG.Extended.sCRM.Avoid),sd(LG.Extended.sCRM.Avoid),sd(AG.Extended.sCRM.Avoid),sd(AT.Extended.sCRM.Avoid), sd(ALL.Extended.sCRM.Avoid)),
+                                       AvoidanceLCL = c(quantile(HG.Extended.sCRM.Avoid, 0.025),quantile(LB.Extended.sCRM.Avoid, 0.025),quantile(GB.Extended.sCRM.Avoid, 0.025),quantile(KI.Extended.sCRM.Avoid[KI.Extended.sCRM.Avoid >0], 0.025),quantile(BH.Extended.sCRM.Avoid, 0.025),quantile(CG.Extended.sCRM.Avoid, 0.025),quantile(LT.Extended.sCRM.Avoid, 0.025),quantile(ST.Extended.sCRM.Avoid, 0.025),quantile(CT.Extended.sCRM.Avoid, 0.025),quantile(SG.Extended.sCRM.Avoid, 0.025),quantile(LG.Extended.sCRM.Avoid, 0.025),quantile(AG.Extended.sCRM.Avoid, 0.025),quantile(AT.Extended.sCRM.Avoid, 0.025), quantile(ALL.Extended.sCRM.Avoid, 0.025)), 
+                                       AvoidanceUCL = c(quantile(HG.Extended.sCRM.Avoid, 0.975),quantile(LB.Extended.sCRM.Avoid, 0.975),quantile(GB.Extended.sCRM.Avoid, 0.975),quantile(KI.Extended.sCRM.Avoid[KI.Extended.sCRM.Avoid >0], 0.975),quantile(BH.Extended.sCRM.Avoid, 0.975),quantile(CG.Extended.sCRM.Avoid, 0.975),quantile(LT.Extended.sCRM.Avoid, 0.975),quantile(ST.Extended.sCRM.Avoid, 0.975),quantile(CT.Extended.sCRM.Avoid, 0.975),quantile(SG.Extended.sCRM.Avoid, 0.975),quantile(LG.Extended.sCRM.Avoid, 0.975),quantile(AG.Extended.sCRM.Avoid, 0.975),quantile(AT.Extended.sCRM.Avoid, 0.975), quantile(ALL.Extended.sCRM.Avoid, 0.975)))
+
+Extended.sCRM.Avoid.Table$ARs = paste(round(Extended.sCRM.Avoid.Table[,2],4), " (",round(Extended.sCRM.Avoid.Table[,3],4), "; ", round(Extended.sCRM.Avoid.Table[,4],4), " - ", round(Extended.sCRM.Avoid.Table[,5],4),")", sep = "") 
+
+
+
+
+## Now plot the avoidance rates and their CIs
+## filter out the species I want for this report
+ExtBandSt_group_avoidance <- Extended.sCRM.Avoid.Table
+ExtBandSt_group_avoidance$Species <- as.character(ExtBandSt_group_avoidance$Species)
+ExtBandSt_group_avoidance$Species <- as.factor(ExtBandSt_group_avoidance$Species)
+
+
+## Save the data set for this plot
+#ExtBandSt_group_avoidance$Source <- "Cook (2021)"
+#write_csv(ExtBandSt_group_avoidance, file = "~/Turbine CRM analysis/Cook (2021) outputs/StExtBand_ARs_Cook.csv")
+
+## Read in the data set
+Cook_StExtBandAR <- read_csv("~/Turbine CRM analysis/Cook (2021) outputs/StExtBand_ARs_Cook.csv")
+Cook_StExtBandAR$ARs = paste(round(Cook_StExtBandAR$Avoidance,4), " (",round(Cook_StExtBandAR$AvoidanceSD,4), "; ", round(Cook_StExtBandAR$AvoidanceLCL,4), " - ", round(Cook_StExtBandAR$AvoidanceUCL,4),")", sep = "") 
+
+
+```
+
+```{r Group-level-avoidance-StExt-band-plotting, echo=FALSE, message=FALSE, warning=FALSE}
+
+## order the factors so the group plot in the order I want
+Cook_StExtBandAR$Species <- factor(Cook_StExtBandAR$Species, levels = c("Gulls & terns", "All Tern", "Little Tern", "Common Tern", "Sandwich Tern", "Small Gull", "Large Gull", "All Gull", "Great Black-Backed Gull", "Lesser Black-backed Gull", "Herring Gull", "Black-headed Gull", "Common Gull" ,"Kittiwake"))
+ExtBandSt_group_avoidance$Species <- factor(ExtBandSt_group_avoidance$Species, levels = c("Gulls & terns", "All Tern", "Little Tern", "Common Tern", "Sandwich Tern", "Small Gull", "Large Gull", "All Gull", "Great Black-Backed Gull", "Lesser Black-backed Gull", "Herring Gull", "Black-headed Gull", "Common Gull" ,"Kittiwake"))
+
+## Bind together my data set and the cook data set
+ExtBandSt_group_avoidance$Source <- "Ozsanlav-Harris et al (2022)"
+AllSt_ExtBand_ARs <- rbind(ExtBandSt_group_avoidance, Cook_StExtBandAR)
+unique(AllSt_ExtBand_ARs$Species)
+## Filter out the species I want and then alter the species names
+AllSt_ExtBand_ARs <- filter(AllSt_ExtBand_ARs, Species %in% c("Herring Gull", "Lesser Black-backed Gull", "Great Black-Backed Gull", "Kittiwake", "Black-headed Gull", "Sandwich Tern", "Small Gull", "Large Gull", "All Gull", "All Tern", "Gulls & terns"))
+AllSt_ExtBand_ARs$Species <- as.character(AllSt_ExtBand_ARs$Species)
+AllSt_ExtBand_ARs$Species <- paste(toupper(substr(AllSt_ExtBand_ARs$Species, 1, 1)), substr(AllSt_ExtBand_ARs$Species, 2, nchar(AllSt_ExtBand_ARs$Species)), sep="")
+
+AllSt_ExtBand_ARs$Species <- factor(AllSt_ExtBand_ARs$Species, levels = c("Gulls & terns", "All Tern", "Sandwich Tern", "Small Gull", "Large Gull", "All Gull", 
+                                                                        "Great Black-Backed Gull", "Lesser Black-backed Gull", "Herring Gull", "Black-headed Gull" ,"Kittiwake"))
+
+
+
+pd<- position_dodge(0.7)
+ggplot(AllSt_ExtBand_ARs, aes(x= Species, y = Avoidance, colour = Source))+
+  geom_point(aes(color = Source), position = pd)+
+  geom_errorbar(aes(ymin=AvoidanceLCL, ymax=AvoidanceUCL, colour= Source), position=pd, width=0.5) +
+  coord_flip() +
+  theme_bw() +
+  ylim(0.8,1) +
+  scale_colour_manual(values=c("#0072B2", "#D55E00")) +
+  ylab("Stochastic Ext. Band avoidance rate") + xlab("Species/Species group") +
+  theme(panel.grid.major.y = element_blank(), panel.grid.minor.y = element_blank(), 
+        axis.text=element_text(size=10), axis.title=element_text(size=14, face = "bold"), 
+        plot.title = element_text(size=12, face="bold"), panel.grid.minor.x = element_blank())
+
+## Read in or save the plots from Cook 2021
+setwd("~/Turbine CRM analysis/OH et al (2022) plots")
+## Save a plot
+#ggsave("ExtBandSt_SpeciesGroup.png", 
+#        width = 28, height = 15, units = "cm")
+
+
+
+
+## Read in the data set
+Cook_StExtBandAR <- read_csv("~/Turbine CRM analysis/Cook (2021) outputs/StExtBand_ARs_Cook.csv")
+Cook_StExtBandAR$ARs = paste(round(Cook_StExtBandAR$Avoidance,4), " (",round(Cook_StExtBandAR$AvoidanceSD,4), "; ", round(Cook_StExtBandAR$AvoidanceLCL,4), " - ", round(Cook_StExtBandAR$AvoidanceUCL,4),")", sep = "") 
+
+## Create a table for the ARs
+Cook_StExtBandAR$AR_2020 <- ExtBandSt_group_avoidance$ARs
+Cook_StExtBandAR$dif <- ((ExtBandSt_group_avoidance$Avoidance-Cook_StExtBandAR$Avoidance)/Cook_StExtBandAR$Avoidance)*100
+colnames(Cook_StExtBandAR)
+TableStExtARs <- subset(Cook_StExtBandAR, select = c("Species", "ARs", "AR_2020", "dif"))
+data.table::setnames(TableStExtARs, old = c("Species", "ARs", "AR_2020", "dif"), 
+                     new = c("Species/Species group", "Cook (2021)", "Ozsanlav-Harris et al (2022)", "% change in rate"))
+TableStExtARs <- filter(TableStExtARs, `Species/Species group` %in% c("Herring Gull", "Lesser Black-backed Gull", "Great Black-Backed Gull", "Kittiwake", "Black-headed Gull", "Sandwich Tern", "Small Gull", "Large Gull", "All Gull", "All Tern", "Gulls & terns"))
+
+## Create the table using Formattable
+TableStExtARs$`% change in rate` <- round(TableStExtARs$`% change in rate`, digits = 3)
+TableStExtARs <- TableStExtARs[c(4,5,1,2,3,9,8,7,6,10,11),]
+customGreen = "#71CA97"
+customRed = "#ff7f7f"
+improvement_formatter <- formatter("span", 
+                                   style = x ~ style(font.weight = "bold", 
+                                                     color = ifelse(x > 0, customGreen, ifelse(x < 0, customRed, "black"))), 
+                                   x ~ icontext(ifelse(x>0, "arrow-up", ifelse(x < 0, "arrow-down", "equal")), x)
+)
+
+StExtTable <- formattable(TableStExtARs, align =c("l","c","c", "c"), list(
+  `Species/Species group` = formatter("span", style = ~ style(color = "grey", font.weight = "bold")), 
+  `% change in rate`= improvement_formatter
+))
+
+
+
+w <- as.htmlwidget(StExtTable, width = 1250, height = 500)
+path <- html_print(w, background = "white", viewer = NULL)
+url <- paste0("file:///", gsub("\\\\", "/", normalizePath(path)))
+
+setwd("~/Turbine CRM analysis/OH et al (2022) plots")
+outputpath <- paste0("StExtBandAR_", " table", ".png")
+
+#webshot::webshot(url = url, file = outputpath, 
+#                 vwidth = 1250, vheight = 500)
+
+
+
+```
+
+
+
+
+
+
