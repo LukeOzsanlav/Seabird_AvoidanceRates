@@ -7,7 +7,7 @@ Code and data to calculate seabird avoidance rates for collision risk modelling.
 - Richard Sherley
 
 ## Code description
-- `Ozsanlav-Harris et al (2022) markdown code.rmd` Markdown file to calcualte avoidacne rates using four different models:
+- `Ozsanlav-Harris et al (2022) markdown code.rmd` Markdown file to calcualte avoidance rates using four different models:
   - Basic Band
   - Extended Band
   - Stochastic Basic Band
