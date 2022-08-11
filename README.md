@@ -8,11 +8,11 @@ Code and data to calculate seabird avoidance rates for collision risk modelling.
 - Richard Sherley
 
 ## Code description
-- `Ozsanlav-Harris et al (2022) markdown code.rmd` Markdown file to calculate avoidance rates using four different models:
-  - Basic Band
-  - Extended Band
-  - Stochastic Basic Band
-  - Stochastic Extended Band
+- `Ozsanlav-Harris et al (2022) markdown code.rmd` Markdown file to calculate avoidance rates using four different collisions risk models:
+                                                    - Basic Band
+                                                    - Extended Band
+                                                    - Stochastic Basic Band
+                                                    - Stochastic Extended Band
 
 ## Data description 
 - `Ozsanlav-Harris et al (2022) Collision Data.csv` main data file containing the number of collisions, correction factors, pasage rates and monitoring periods for each windfarm included in the analysis
