@@ -11,6 +11,8 @@ Code and data to calculate seabird avoidance rates for collision risk modelling.
 ## Link to report 🔗
 The fianl published report can be found at the follwing link [https://hub.jncc.gov.uk/assets/de5903fe-81c5-4a37-a5bc-387cf704924d](https://hub.jncc.gov.uk/assets/de5903fe-81c5-4a37-a5bc-387cf704924d)
 
+**NOTE**: there was a follow up report that recalcualted avoidacen rates using a slighlty altered method. This was lead by Stephen Lang and can be found here: [https://data.jncc.gov.uk/data/de5903fe-81c5-4a37-a5bc-387cf704924d/jncc-report-732-annex-4-follow-on-analysis.pdf](https://data.jncc.gov.uk/data/de5903fe-81c5-4a37-a5bc-387cf704924d/jncc-report-732-annex-4-follow-on-analysis.pdf)
+
 ## Citation
 Ozsanlav-Harris, L., Inger, R. & Sherley, R. 2023. Review of data used to calculate avoidance rates for collision risk modelling of seabirds. JNCC Report 732, JNCC, Peterborough, ISSN 0963-8091.
 
